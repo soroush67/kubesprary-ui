@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kubespray Variables Editor</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark">K</span>
+        <span class="brand-text">Kubespray <strong>Variables Editor</strong></span>
+      </div>
+      <div class="inv-controls">
+        <label for="invSelect">Inventory</label>
+        <select id="invSelect"></select>
+        <button id="newInvBtn" class="btn-secondary" title="Create a new cluster inventory">+ New</button>
+        <button id="deleteInvBtn" class="btn-danger" title="Delete this inventory">Delete</button>
+      </div>
+      <div class="view-tabs">
+        <button id="filesTabBtn" class="tab-btn active">Files</button>
+        <button id="opsTabBtn" class="tab-btn">Cluster Operations</button>
+      </div>
+      <div class="search-controls">
+        <input id="searchInput" type="search" placeholder="Search variables everywhere…" />
+        <div id="searchResults" class="search-results hidden"></div>
+      </div>
+    </header>
+
+    <div class="body">
+      <nav id="sidebar" class="sidebar"></nav>
+
+      <main id="content" class="content">
+        <div class="empty-state">
+          <p>Select a file from the sidebar to edit its variables.</p>
+        </div>
+      </main>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+  </div>
+
+<script src="app.js"></script>
+</body>
+</html>

@@ -1,0 +1,86 @@
+services:
+  webui:
+    build: .
+    ports:
+      - "8420:8420"
+    volumes:
+      - ../kubespray:/kubespray
+    environment:
+      - KUBESPRAY_ROOT=/kubespray
+    restart: unless-stopped
+
+  rustfs:
+    image: rustfs/rustfs:latest
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "9000:9000" # S3 API port
+      - "9001:9001" # Console port
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      # SECURITY: these defaults are public and well-known - set real values in .env
+      # before exposing this beyond localhost.
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=info
+      # This host has a single physical disk, so the 4 data volumes below
+      # can't satisfy RustFS's erasure-coding "distinct physical disks" check.
+      # Only bypass this on single-disk boxes; remove it on real multi-disk hardware.
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+    volumes:
+      - rustfs_data_0:/data/rustfs0
+      - rustfs_data_1:/data/rustfs1
+      - rustfs_data_2:/data/rustfs2
+      - rustfs_data_3:/data/rustfs3
+      - rustfs_logs:/app/logs
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  rustfs-volume-permission-helper:
+    image: alpine
+    volumes:
+      - rustfs_data_0:/data0
+      - rustfs_data_1:/data1
+      - rustfs_data_2:/data2
+      - rustfs_data_3:/data3
+      - rustfs_logs:/logs
+    command: >
+      sh -c "
+        chown -R 10001:10001 /data0 /data1 /data2 /data3 /logs &&
+        echo 'Volume permissions fixed'
+      "
+    restart: "no"
+
+  backup-sync:
+    build: ./backup-sync
+    depends_on:
+      - rustfs
+    environment:
+      - INVENTORY_NAME=${BACKUP_INVENTORY_NAME:-local}
+      - SYNC_INTERVAL_SECONDS=${BACKUP_SYNC_INTERVAL_SECONDS:-900}
+      - RUSTFS_ENDPOINT=http://rustfs:9000
+      - RUSTFS_ACCESS_KEY=${RUSTFS_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_BUCKET=etcd-backups
+      - ETCD_BACKUP_PREFIX=${ETCD_BACKUP_PREFIX:-/var/backups}
+      - KUBESPRAY_ROOT=/kubespray
+    volumes:
+      - ../kubespray:/kubespray:ro
+      - ${SSH_DIR:-/home/soroush/.ssh}:/root/.ssh:ro
+    restart: unless-stopped
+
+volumes:
+  rustfs_data_0:
+  rustfs_data_1:
+  rustfs_data_2:
+  rustfs_data_3:
+  rustfs_logs:
