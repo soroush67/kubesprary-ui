@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -12,6 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import hosts_inventory as hv
+import offline as off
 import parser as gv
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -21,6 +23,7 @@ SAMPLE_DIR = INVENTORY_ROOT / "sample"
 STATIC_DIR = (BASE_DIR / ".." / "static").resolve()
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,200}$")
 
 # Friendly labels/groups for the known kubespray group_vars files.
 FILE_META = {
@@ -294,6 +297,95 @@ def put_hosts_raw(inv: str, payload: RawPayload):
         raise HTTPException(400, f"Invalid YAML: {exc}")
     _hosts_file(inv).write_text(text if text.endswith("\n") else text + "\n")
     return {"hosts": hosts, "raw": _hosts_file(inv).read_text()}
+
+
+def _run_git(args: list[str]) -> str:
+    result = subprocess.run(
+        ["git", *args],
+        cwd=str(KUBESPRAY_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise HTTPException(500, f"git {' '.join(args)} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+class CheckoutPayload(BaseModel):
+    version: str
+
+
+def _has_tracked_changes() -> bool:
+    # Untracked files (e.g. extra_playbooks/ additions) never get clobbered or
+    # lost by `git checkout`, so only uncommitted changes to tracked files -
+    # like group_vars edits made from the Files tab - should block a checkout.
+    lines = _run_git(["status", "--porcelain"]).splitlines()
+    return any(not line.startswith("??") for line in lines)
+
+
+VERSION_BRANCH_PREFIX = "kubespray-version/"
+
+
+def _current_ref() -> str:
+    # Tag checkouts land on a local branch named "kubespray-version/<tag>"
+    # (see checkout_kubespray_version) rather than the bare tag name, to avoid
+    # rev-parse returning an ambiguous "heads/<tag>" when a branch and a tag
+    # share the same short name. Strip the prefix back off for display.
+    ref = _run_git(["rev-parse", "--abbrev-ref", "HEAD"]).strip()
+    return ref.removeprefix(VERSION_BRANCH_PREFIX)
+
+
+@app.get("/api/kubespray/versions")
+def list_kubespray_versions():
+    _run_git(["fetch", "--tags", "--depth=1", "origin"])
+    out = _run_git([
+        "for-each-ref",
+        "--sort=-version:refname",
+        "--format=%(refname:short)|%(creatordate:iso-strict)|%(objectname:short)",
+        "refs/tags",
+    ])
+    versions = []
+    for line in out.splitlines():
+        name, date, sha = line.split("|")
+        versions.append({"name": name, "date": date, "sha": sha})
+        if len(versions) >= 10:
+            break
+
+    current = _current_ref()
+    dirty = _has_tracked_changes()
+    return {"current": current, "dirty": dirty, "versions": versions}
+
+
+@app.post("/api/kubespray/checkout")
+def checkout_kubespray_version(payload: CheckoutPayload):
+    version = payload.version
+    if not BRANCH_NAME_RE.match(version):
+        raise HTTPException(400, "Invalid version name.")
+    if _has_tracked_changes():
+        raise HTTPException(409, "kubespray checkout has uncommitted changes. Commit or discard them before switching versions.")
+
+    ref_check = subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", f"refs/tags/{version}"],
+        cwd=str(KUBESPRAY_ROOT),
+    )
+    if ref_check.returncode != 0:
+        raise HTTPException(404, f"Version '{version}' not found on origin. Refresh the version list and try again.")
+
+    _run_git(["checkout", "-B", VERSION_BRANCH_PREFIX + version, f"refs/tags/{version}"])
+    current = _current_ref()
+    sha = _run_git(["rev-parse", "--short", "HEAD"]).strip()
+    return {"current": current, "sha": sha}
+
+
+@app.get("/api/inventories/{inv}/offline/plan")
+def offline_plan(inv: str):
+    inv_dir = _inventory_dir(inv)
+    config = off.detect_config(inv_dir)
+    status = off.artifact_status(KUBESPRAY_ROOT)
+    current = _current_ref()
+    stages = off.build_plan(KUBESPRAY_ROOT, inv, inv_dir, current, config, status)
+    return {"current_version": current, "config": config, "status": status, "stages": stages}
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

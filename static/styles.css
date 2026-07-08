@@ -236,6 +236,22 @@ input[type=checkbox].switch:checked::after { background: var(--accent); transfor
 .ops-cmd-row { display: flex; gap: 10px; align-items: flex-start; }
 .ops-cmd-output { min-height: 90px; flex: 1; }
 
+.branch-list { display: flex; flex-direction: column; gap: 8px; max-width: 760px; }
+.branch-row {
+  display: grid;
+  grid-template-columns: 1fr 200px 90px 110px;
+  gap: 14px;
+  align-items: center;
+  background: var(--bg-panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+}
+.branch-row.active { border-color: var(--accent-2); }
+.branch-name { font-family: var(--mono); font-size: 13.5px; }
+.branch-date { font-size: 12px; color: var(--text-dim); }
+.branch-sha { font-family: var(--mono); font-size: 12px; color: var(--text-dim); }
+
 .toast {
   position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
   background: var(--bg-panel-2); border: 1px solid var(--border); padding: 10px 18px;

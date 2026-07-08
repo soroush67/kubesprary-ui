@@ -55,6 +55,13 @@ async function api(path, opts) {
   return data;
 }
 
+const TOP_TABS = {
+  files: "filesTabBtn",
+  ops: "opsTabBtn",
+  kubespray: "kubesprayTabBtn",
+  offline: "offlineTabBtn",
+};
+
 async function init() {
   await loadInventories();
   invSelect.addEventListener("change", () => selectInventory(invSelect.value));
@@ -62,6 +69,8 @@ async function init() {
   el("#deleteInvBtn").addEventListener("click", deleteInventory);
   el("#filesTabBtn").addEventListener("click", () => switchTab("files"));
   el("#opsTabBtn").addEventListener("click", () => switchTab("ops"));
+  el("#kubesprayTabBtn").addEventListener("click", () => switchTab("kubespray"));
+  el("#offlineTabBtn").addEventListener("click", () => switchTab("offline"));
   searchInput.addEventListener("input", debounce(onSearch, 250));
   document.addEventListener("click", (e) => {
     if (!searchResults.contains(e.target) && e.target !== searchInput) {
@@ -70,21 +79,29 @@ async function init() {
   });
 }
 
+function setActiveTabButtons(tab) {
+  for (const [key, id] of Object.entries(TOP_TABS)) {
+    el(`#${id}`).classList.toggle("active", tab === key);
+  }
+}
+
 async function switchTab(tab) {
   if (tab === state.topTab) {
-    el("#filesTabBtn").classList.toggle("active", tab === "files");
-    el("#opsTabBtn").classList.toggle("active", tab === "ops");
+    setActiveTabButtons(tab);
     return;
   }
   if (state.topTab === "files" && hasUnsavedChanges()) {
     if (!confirm("You have unsaved changes on the current view. Discard them?")) return;
   }
   state.topTab = tab;
-  el("#filesTabBtn").classList.toggle("active", tab === "files");
-  el("#opsTabBtn").classList.toggle("active", tab === "ops");
-  sidebar.classList.toggle("hidden-tab", tab === "ops");
+  setActiveTabButtons(tab);
+  sidebar.classList.toggle("hidden-tab", tab !== "files");
   if (tab === "ops") {
     await loadOps();
+  } else if (tab === "kubespray") {
+    await loadKubespray();
+  } else if (tab === "offline") {
+    await loadOffline();
   } else {
     renderSidebar();
     if (state.currentPath === HOSTS_VIEW) {
@@ -774,6 +791,238 @@ function renderOpsFields(body) {
     syncNote.textContent = "If this webui is running via docker-compose, the backup-sync container periodically pulls these snapshot files off the etcd nodes and mirrors them into the RustFS bucket \"etcd-backups\" (see BACKUP_INVENTORY_NAME in .env).";
     body.appendChild(syncNote);
   }
+}
+
+// ---------- Kubespray Version (git tag switcher) ----------
+
+async function loadKubespray() {
+  content.innerHTML = `<div class="empty-state"><p>Fetching versions from origin…</p></div>`;
+  try {
+    const data = await api("/api/kubespray/versions");
+    renderKubespray(data);
+  } catch (e) {
+    content.innerHTML = "";
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+function renderKubespray(data) {
+  const wrap = document.createElement("div");
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2>Kubespray Version</h2><span class="path">origin tags</span>`;
+  wrap.appendChild(header);
+
+  const desc = document.createElement("div");
+  desc.className = "file-desc";
+  desc.textContent = "Fetches the 10 newest release tags (e.g. v2.31.0) from origin and lets you check one out into the kubespray checkout this webui runs against.";
+  wrap.appendChild(desc);
+
+  const current = document.createElement("div");
+  current.className = "ops-note";
+  current.innerHTML = `Current: <strong>${data.current}</strong>`;
+  wrap.appendChild(current);
+
+  if (data.dirty) {
+    const dirtyNote = document.createElement("div");
+    dirtyNote.className = "ops-note danger";
+    dirtyNote.textContent = "The kubespray checkout has uncommitted changes. Switching versions is blocked until you commit or discard them (this protects any group_vars edits made from the Files tab).";
+    wrap.appendChild(dirtyNote);
+  }
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "toolbar";
+  toolbar.innerHTML = `<button id="refreshBranchesBtn" class="btn-secondary">Refresh versions</button>`;
+  wrap.appendChild(toolbar);
+
+  const list = document.createElement("div");
+  list.className = "branch-list";
+  for (const v of data.versions) {
+    const row = document.createElement("div");
+    row.className = "branch-row" + (v.name === data.current ? " active" : "");
+    row.innerHTML = `
+      <span class="branch-name">${v.name}</span>
+      <span class="branch-date">${new Date(v.date).toLocaleString()}</span>
+      <span class="branch-sha">${v.sha}</span>
+    `;
+    const btn = document.createElement("button");
+    btn.className = "btn-primary";
+    btn.textContent = v.name === data.current ? "Current" : "Checkout";
+    btn.disabled = v.name === data.current || data.dirty;
+    btn.addEventListener("click", () => checkoutKubesprayVersion(v.name));
+    row.appendChild(btn);
+    list.appendChild(row);
+  }
+  wrap.appendChild(list);
+
+  content.innerHTML = "";
+  content.appendChild(wrap);
+
+  el("#refreshBranchesBtn").addEventListener("click", loadKubespray);
+}
+
+async function checkoutKubesprayVersion(version) {
+  if (!confirm(`Check out version "${version}" in the kubespray checkout? This changes the actual playbooks/roles used for every inventory.`)) return;
+  try {
+    await api("/api/kubespray/checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ version }),
+    });
+    showToast(`Checked out "${version}".`, "success");
+    await loadKubespray();
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+// ---------- Offline / Air-gapped Install (command builder) ----------
+
+const OFFLINE_STATUS_LABEL = {
+  files_list: "files.list",
+  images_list: "images.list",
+  offline_files_dir: "offline-files/",
+  offline_files_archive: "offline-files.tar.gz",
+  container_images_archive: "container-images.tar.gz",
+  pip_packages_dir: "pip-packages/",
+  helm_charts_dir: "helm-charts/",
+};
+
+const OFFLINE_STAGE_STATUS_KEY = {
+  "generate-lists": ["files_list", "images_list"],
+  "download-files": ["offline_files_dir", "offline_files_archive"],
+  "container-images": ["container_images_archive"],
+  "pip-packages": ["pip_packages_dir"],
+  "helm-charts": ["helm_charts_dir"],
+};
+
+async function loadOffline() {
+  content.innerHTML = `<div class="empty-state"><p>Checking offline-install status…</p></div>`;
+  try {
+    const data = await api(`/api/inventories/${state.inventory}/offline/plan`);
+    renderOffline(data);
+  } catch (e) {
+    content.innerHTML = "";
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+function offlineStatusLine(data, stageId) {
+  const keys = OFFLINE_STAGE_STATUS_KEY[stageId] || [];
+  const parts = keys.map((k) => {
+    const info = data.status[k];
+    const label = OFFLINE_STATUS_LABEL[k];
+    if (!info.exists) return `${label}: not generated yet`;
+    if (info.line_count !== undefined) return `${label}: ${info.line_count} entries`;
+    if (info.file_count !== undefined) return `${label}: ${info.file_count} files`;
+    return `${label}: present`;
+  });
+  return parts.join(" · ");
+}
+
+function renderOffline(data) {
+  const wrap = document.createElement("div");
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2>Offline / Air-gapped Install</h2><span class="path">${state.inventory || ""}</span>`;
+  wrap.appendChild(header);
+
+  const desc = document.createElement("div");
+  desc.className = "file-desc";
+  desc.textContent = "Builds the exact commands to prepare every artifact kubespray needs for an air-gapped install of the currently checked-out version. Nothing runs automatically — copy each command and run it yourself where it says to.";
+  wrap.appendChild(desc);
+
+  const summary = document.createElement("div");
+  summary.className = "ops-note";
+  summary.innerHTML = `Kubespray version: <strong>${data.current_version}</strong> &nbsp;·&nbsp; ` +
+    `container_manager: <strong>${data.config.container_manager}</strong> &nbsp;·&nbsp; ` +
+    `kube_network_plugin: <strong>${data.config.kube_network_plugin}</strong> &nbsp;·&nbsp; ` +
+    `helm_enabled: <strong>${data.config.helm_enabled}</strong>`;
+  wrap.appendChild(summary);
+
+  for (const stage of data.stages) {
+    const card = document.createElement("div");
+    card.className = "host-card";
+
+    const stageHeader = document.createElement("div");
+    stageHeader.className = "file-header";
+    const statusLine = offlineStatusLine(data, stage.id);
+    stageHeader.innerHTML = `<h2 style="font-size:15px">${stage.title}</h2>` +
+      `<span class="path">${stage.relevant ? (statusLine || "") : "not needed for this inventory"}</span>`;
+    card.appendChild(stageHeader);
+
+    const note = document.createElement("div");
+    note.className = "ops-note" + (stage.id === "container-images" ? " danger" : "");
+    note.textContent = stage.note;
+    note.style.marginBottom = "10px";
+    card.appendChild(note);
+
+    if (stage.relevant) {
+      const outputRow = document.createElement("div");
+      outputRow.className = "ops-cmd-row";
+      const output = document.createElement("textarea");
+      output.className = "raw-editor ops-cmd-output";
+      output.readOnly = true;
+      output.spellcheck = false;
+      output.value = stage.command;
+      const copyBtn = document.createElement("button");
+      copyBtn.className = "btn-primary";
+      copyBtn.textContent = "Copy";
+      copyBtn.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(output.value);
+        showToast("Command copied.", "success");
+      });
+      outputRow.appendChild(output);
+      outputRow.appendChild(copyBtn);
+      card.appendChild(outputRow);
+
+      if (stage.id === "helm-charts") {
+        const form = document.createElement("div");
+        form.className = "ops-fields";
+        form.style.marginTop = "12px";
+        form.style.marginBottom = "0";
+
+        const repoName = document.createElement("input");
+        repoName.type = "text";
+        repoName.placeholder = "e.g. ingress-nginx";
+        const repoUrl = document.createElement("input");
+        repoUrl.type = "text";
+        repoUrl.placeholder = "e.g. https://kubernetes.github.io/ingress-nginx";
+        const chartName = document.createElement("input");
+        chartName.type = "text";
+        chartName.placeholder = "e.g. ingress-nginx/ingress-nginx";
+        const chartVersion = document.createElement("input");
+        chartVersion.type = "text";
+        chartVersion.placeholder = "e.g. 4.13.3";
+
+        form.appendChild(opsField("Repo name", repoName));
+        form.appendChild(opsField("Repo URL", repoUrl));
+        form.appendChild(opsField("Chart name", chartName));
+        form.appendChild(opsField("Chart version", chartVersion));
+
+        const addBtn = document.createElement("button");
+        addBtn.className = "btn-secondary";
+        addBtn.textContent = "Add another chart to the command above";
+        addBtn.addEventListener("click", () => {
+          if (!repoName.value || !repoUrl.value || !chartName.value || !chartVersion.value) {
+            showToast("Fill in all four fields first.", "error");
+            return;
+          }
+          output.value += `\n\nhelm repo add ${repoName.value} ${repoUrl.value} && helm repo update && ` +
+            `helm pull ${chartName.value} --version ${chartVersion.value} --destination ${output.value.match(/--destination (\S+)/)?.[1] || "./helm-charts"}`;
+        });
+        form.appendChild(addBtn);
+        card.appendChild(form);
+      }
+    }
+
+    wrap.appendChild(card);
+  }
+
+  content.innerHTML = "";
+  content.appendChild(wrap);
 }
 
 function renderVarRow(entry) {
