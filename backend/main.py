@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import shutil
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,12 +19,20 @@ import parser as gv
 
 BASE_DIR = Path(__file__).resolve().parent
 KUBESPRAY_ROOT = Path(os.environ["KUBESPRAY_ROOT"]).resolve() if os.environ.get("KUBESPRAY_ROOT") else (BASE_DIR / ".." / ".." / "kubespray").resolve()
+# Real host-side path to KUBESPRAY_ROOT - only differs from it when running
+# containerized (see HOST_KUBESPRAY_ROOT in docker-compose.yml). Needed for any
+# `docker run -v` command built by offline.py, since those are resolved by the
+# host's daemon against host paths, not this container's.
+HOST_KUBESPRAY_ROOT = Path(os.environ["HOST_KUBESPRAY_ROOT"]).resolve() if os.environ.get("HOST_KUBESPRAY_ROOT") else KUBESPRAY_ROOT
 INVENTORY_ROOT = KUBESPRAY_ROOT / "inventory"
 SAMPLE_DIR = INVENTORY_ROOT / "sample"
 STATIC_DIR = (BASE_DIR / ".." / "static").resolve()
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,200}$")
+REGISTRY_ADDR_RE = re.compile(r"^[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
+UBUNTU_RELEASE_RE = re.compile(r"^[0-9]{2}\.[0-9]{2}$")
+HOST_ADDR_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
 # Friendly labels/groups for the known kubespray group_vars files.
 FILE_META = {
@@ -384,8 +393,160 @@ def offline_plan(inv: str):
     config = off.detect_config(inv_dir)
     status = off.artifact_status(KUBESPRAY_ROOT)
     current = _current_ref()
-    stages = off.build_plan(KUBESPRAY_ROOT, inv, inv_dir, current, config, status)
-    return {"current_version": current, "config": config, "status": status, "stages": stages}
+    stages = off.build_plan(KUBESPRAY_ROOT, HOST_KUBESPRAY_ROOT, inv, inv_dir, current, config, status)
+    offline_dir = str(KUBESPRAY_ROOT / "contrib" / "offline")
+    host_offline_dir = str(HOST_KUBESPRAY_ROOT / "contrib" / "offline")
+    # Run state lives server-side (OFFLINE_STAGE_LOCKS) precisely so a page refresh
+    # doesn't lose track of an in-progress run - the frontend's own idea of "is this
+    # running" is just in-memory JS state, gone on reload, even though the actual
+    # subprocess keeps going regardless of any browser tab being open.
+    running = {stage_id: lock.locked() for stage_id, lock in OFFLINE_STAGE_LOCKS.items()}
+    return {
+        "current_version": current, "config": config, "status": status, "stages": stages,
+        "offline_dir": offline_dir, "host_offline_dir": host_offline_dir, "running": running,
+        "logs": OFFLINE_STAGE_LOGS,
+    }
+
+
+class RegistryPayload(BaseModel):
+    registry_mode: str  # "local" | "remote"
+    registry_address: str | None = None
+
+
+class OsPackagesPayload(BaseModel):
+    ubuntu_release: str = "24.04"
+
+
+# Two runs of the *same* offline stage racing each other has repeatedly caused real
+# damage (download-files' rm -rf wiping a concurrent run's progress; os-packages'
+# two `apt-get` processes fighting over the same lock file, one dying with a
+# cryptic "held by process 0" - PID 0 because the holder is in a different
+# container's PID namespace, unresolvable from this one). These aren't inventory-
+# scoped (they all touch shared files under contrib/offline/), so one lock per
+# stage id, independent of which inventory triggered it.
+OFFLINE_STAGE_LOCKS: dict[str, asyncio.Lock] = {
+    "generate-lists": asyncio.Lock(),
+    "download-files": asyncio.Lock(),
+    "container-images": asyncio.Lock(),
+    "os-packages": asyncio.Lock(),
+    "pip-packages": asyncio.Lock(),
+}
+# The live stream in _stream_shell only reaches whichever single browser tab's
+# fetch() is actually reading it - if that tab reloads (or a different tab/session
+# looks), the connection is gone but the server-side subprocess keeps running
+# regardless (observed directly - killing the client doesn't kill the process).
+# So also mirror each stage's output here, capped, and hand it back from
+# /offline/plan - any page load can see "where things stand" even if it wasn't
+# the one that started the run.
+OFFLINE_STAGE_LOGS: dict[str, str] = {stage_id: "" for stage_id in OFFLINE_STAGE_LOCKS}
+OFFLINE_LOG_CAP = 20000
+
+
+async def _stream_shell(cmd: str, cwd: Path, lock: asyncio.Lock, stage_id: str):
+    await lock.acquire()
+    OFFLINE_STAGE_LOGS[stage_id] = ""
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            cwd=str(cwd),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        async for raw_line in proc.stdout:
+            text = raw_line.decode(errors="replace")
+            OFFLINE_STAGE_LOGS[stage_id] = (OFFLINE_STAGE_LOGS[stage_id] + text)[-OFFLINE_LOG_CAP:]
+            yield text
+        await proc.wait()
+        tail = f"\n[exit code {proc.returncode}]\n"
+        OFFLINE_STAGE_LOGS[stage_id] += tail
+        yield tail
+    finally:
+        lock.release()
+
+
+def _check_not_running(stage_id: str) -> asyncio.Lock:
+    lock = OFFLINE_STAGE_LOCKS[stage_id]
+    if lock.locked():
+        raise HTTPException(409, f"A '{stage_id}' run is already in progress - wait for it to finish before starting another.")
+    return lock
+
+
+@app.post("/api/inventories/{inv}/offline/run/generate-lists")
+def run_generate_lists(inv: str):
+    inv_dir = _inventory_dir(inv)
+    lock = _check_not_running("generate-lists")
+    stages = off.build_plan(KUBESPRAY_ROOT, HOST_KUBESPRAY_ROOT, inv, inv_dir, _current_ref(), off.detect_config(inv_dir), off.artifact_status(KUBESPRAY_ROOT))
+    cmd = next(s["command"] for s in stages if s["id"] == "generate-lists")
+    return StreamingResponse(_stream_shell(cmd, KUBESPRAY_ROOT, lock, "generate-lists"), media_type="text/plain")
+
+
+@app.post("/api/inventories/{inv}/offline/run/download-files")
+def run_download_files(inv: str):
+    _inventory_dir(inv)
+    lock = _check_not_running("download-files")
+    cmd = off.download_files_command(KUBESPRAY_ROOT)
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "download-files"),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/offline/run/container-images")
+def run_container_images(inv: str, payload: RegistryPayload):
+    _inventory_dir(inv)
+    if payload.registry_mode not in ("local", "remote"):
+        raise HTTPException(400, "Invalid registry mode.")
+    if payload.registry_mode == "remote":
+        if not payload.registry_address or not REGISTRY_ADDR_RE.match(payload.registry_address):
+            raise HTTPException(400, "Invalid registry address.")
+    lock = _check_not_running("container-images")
+    cmd = off.container_images_command(KUBESPRAY_ROOT, payload.registry_mode, payload.registry_address)
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "container-images"),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/offline/run/os-packages")
+def run_os_packages(inv: str, payload: OsPackagesPayload):
+    inv_dir = _inventory_dir(inv)
+    if not UBUNTU_RELEASE_RE.match(payload.ubuntu_release):
+        raise HTTPException(400, "Invalid Ubuntu release, expected e.g. 24.04.")
+    lock = _check_not_running("os-packages")
+    cmd = off.os_packages_command(KUBESPRAY_ROOT, HOST_KUBESPRAY_ROOT, payload.ubuntu_release, off.detect_config(inv_dir))
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "os-packages"),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/offline/run/pip-packages")
+def run_pip_packages(inv: str):
+    _inventory_dir(inv)
+    lock = _check_not_running("pip-packages")
+    cmd = off.pip_packages_command(KUBESPRAY_ROOT)
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "pip-packages"),
+        media_type="text/plain",
+    )
+
+
+class OfflineConfigurePayload(BaseModel):
+    host_address: str
+
+
+@app.post("/api/inventories/{inv}/offline/configure")
+def configure_offline_yml(inv: str, payload: OfflineConfigurePayload):
+    if not HOST_ADDR_RE.match(payload.host_address):
+        raise HTTPException(400, "Invalid host address.")
+    target = _resolve_file(inv, "all/offline.yml")
+    if not target.is_file():
+        raise HTTPException(404, "offline.yml does not exist in this inventory.")
+    updates = off.offline_yml_updates(payload.host_address)
+    new_parsed = gv.apply_updates(gv.parse(target.read_text()), updates)
+    new_text = new_parsed.to_text()
+    target.write_text(new_text)
+    return {"path": "all/offline.yml", "raw": new_text}
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

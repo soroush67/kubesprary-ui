@@ -877,7 +877,7 @@ async function checkoutKubesprayVersion(version) {
   }
 }
 
-// ---------- Offline / Air-gapped Install (command builder) ----------
+// ---------- Offline / Air-gapped Install (command builder + real execution) ----------
 
 const OFFLINE_STATUS_LABEL = {
   files_list: "files.list",
@@ -887,6 +887,7 @@ const OFFLINE_STATUS_LABEL = {
   container_images_archive: "container-images.tar.gz",
   pip_packages_dir: "pip-packages/",
   helm_charts_dir: "helm-charts/",
+  os_packages_dir: "os-packages/",
 };
 
 const OFFLINE_STAGE_STATUS_KEY = {
@@ -894,8 +895,22 @@ const OFFLINE_STAGE_STATUS_KEY = {
   "download-files": ["offline_files_dir", "offline_files_archive"],
   "container-images": ["container_images_archive"],
   "pip-packages": ["pip_packages_dir"],
+  "os-packages": ["os_packages_dir"],
   "helm-charts": ["helm_charts_dir"],
 };
+
+// Stages with a real "Run" button. Backed by /api/inventories/{inv}/offline/run/{id}.
+const OFFLINE_RUNNABLE = new Set(["generate-lists", "download-files", "container-images", "os-packages", "pip-packages"]);
+
+if (!state.offlineForm) {
+  const guessedHost = ["localhost", "127.0.0.1"].includes(location.hostname) ? "" : location.hostname;
+  state.offlineForm = { registryMode: "local", registryAddress: "", ubuntuRelease: "24.04", hostAddress: guessedHost };
+}
+// Accumulated run output per stage id, kept across re-renders so a completed run's
+// log isn't wiped out the moment the status refresh redraws the tab.
+if (!state.offlineLogs) {
+  state.offlineLogs = {};
+}
 
 async function loadOffline() {
   content.innerHTML = `<div class="empty-state"><p>Checking offline-install status…</p></div>`;
@@ -921,6 +936,187 @@ function offlineStatusLine(data, stageId) {
   return parts.join(" · ");
 }
 
+async function runOfflineStage(stageId, body, logEl, btn) {
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.offlineLogs[stageId] = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/offline/run/${stageId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    if (!res.ok) {
+      // Errors caught before streaming starts (bad input, or another run of this
+      // same stage already in progress - see OFFLINE_STAGE_LOCKS backend-side)
+      // come back as plain JSON, not a stream - surface the real message instead
+      // of dumping it raw into the log.
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.offlineLogs[stageId] += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    // Re-fetch status so the toast says exactly what got created (e.g. "files.list:
+    // 24 entries"), then redraw the tab - this also fixes up Run-button
+    // enabled/disabled state on OTHER stages that depended on this one, and
+    // (since logEl's content was stashed in state.offlineLogs above) the redraw
+    // restores this log instead of wiping it.
+    const freshData = await api(`/api/inventories/${state.inventory}/offline/plan`);
+    const line = offlineStatusLine(freshData, stageId);
+    showToast(line ? `Done - ${line}` : "Done.", "success");
+    renderOffline(freshData);
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+const OFFLINE_LOCAL_REGISTRY_PORT = 5000;
+const OFFLINE_LOCAL_NGINX_PORT = 8080;
+const OFFLINE_LOCAL_APT_PORT = 8081;
+const OFFLINE_LOCAL_PIP_PORT = 8082;
+
+// Mirrors offline.py's container_images_command() so the displayed command stays
+// truthful while the user edits the registry fields (the real run always goes
+// through the backend builder - this is display-only). "local" targets the
+// always-on offline-registry compose service, already running - nothing to start.
+function buildContainerImagesCommand(offlineDir) {
+  const f = state.offlineForm;
+  const dest = (f.registryMode === "remote" && f.registryAddress) ? f.registryAddress : `localhost:${OFFLINE_LOCAL_REGISTRY_PORT}`;
+  return `cd ${offlineDir} && IMAGES_FROM_FILE=${offlineDir}/temp/images.list ` +
+    `./manage-offline-container-images.sh create && DESTINATION_REGISTRY=${dest} ./manage-offline-container-images.sh register`;
+}
+
+// Mirrors offline.py's os_packages_command(). offlineDir is the container-internal
+// path (used for mkdir, run inside this container); hostOfflineDir is the real
+// host path (needed for the throwaway ubuntu container's `docker run -v`, since
+// that's resolved by the HOST daemon via the mounted socket) - see offline.py.
+function buildOsPackagesCommand(offlineDir, hostOfflineDir, packages) {
+  const f = state.offlineForm;
+  const outdir = `${offlineDir}/os-packages`;
+  const hostOutdir = `${hostOfflineDir}/os-packages`;
+  return `mkdir -p ${outdir} && docker run --rm -v ${hostOutdir}:/var/cache/apt/archives ` +
+    `ubuntu:${f.ubuntuRelease} bash -c "apt-get update -q && apt-get install --download-only -y ${packages.join(" ")}" && ` +
+    `cd ${outdir} && dpkg-scanpackages . /dev/null 2>/dev/null | gzip -9c > Packages.gz`;
+}
+
+// Silent background check while a stage is running (server-side, per
+// OFFLINE_STAGE_LOCKS/OFFLINE_STAGE_LOGS in main.py - both outlive this page load,
+// e.g. after a refresh, or a different tab looking). Only touches the DOM (a full
+// renderOffline redraw) when something actually changed (a stage started/finished,
+// or its log grew) - not on every tick - so it doesn't blow away whatever the user
+// is doing on unrelated cards (typing in a field, mid-scroll) the way redrawing on
+// a fixed timer regardless of change would.
+async function pollOfflineRunning(previousSnapshot) {
+  if (state.topTab !== "offline") return;
+  try {
+    const freshData = await api(`/api/inventories/${state.inventory}/offline/plan`);
+    const snapshot = { running: freshData.running, logs: freshData.logs };
+    const changed = JSON.stringify(snapshot) !== JSON.stringify(previousSnapshot);
+    if (changed) {
+      renderOffline(freshData);
+    } else if (Object.values(freshData.running).some(Boolean)) {
+      setTimeout(() => pollOfflineRunning(snapshot), 4000);
+    }
+  } catch (e) {
+    // Transient - the next manual tab switch/reload will surface real errors.
+  }
+}
+
+// "Point kubespray at these repos": writes registry_host/files_repo/ubuntu_repo/
+// debian_repo into this inventory's offline.yml (reusing the same group_vars
+// update mechanism the Files tab uses), pointing at the address the real target
+// k8s nodes - separate machines - will reach this host at. Deliberately not
+// auto-filled with "localhost": that's only correct for the container-images push
+// step, which runs locally via the Docker socket.
+function renderOfflineConfigureCard() {
+  const card = document.createElement("div");
+  card.className = "host-card";
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2 style="font-size:15px">Point kubespray at these repos</h2>`;
+  card.appendChild(header);
+
+  const note = document.createElement("div");
+  note.className = "ops-note";
+  note.textContent = "Writes registry_host/files_repo/ubuntu_repo/debian_repo into this inventory's offline.yml. Use the address your CLUSTER NODES will reach this host at - not localhost, which only makes sense for the push step above (that runs locally via the Docker socket).";
+  note.style.marginBottom = "10px";
+  card.appendChild(note);
+
+  const form = document.createElement("div");
+  form.className = "ops-fields";
+
+  const hostInput = document.createElement("input");
+  hostInput.type = "text";
+  hostInput.placeholder = "e.g. 192.168.1.50 or repo-host.example.com";
+  hostInput.value = state.offlineForm.hostAddress;
+
+  const preview = document.createElement("textarea");
+  preview.className = "raw-editor ops-cmd-output";
+  preview.readOnly = true;
+  preview.spellcheck = false;
+  preview.style.marginTop = "10px";
+  preview.style.minHeight = "110px";
+
+  function refreshPreview() {
+    const h = state.offlineForm.hostAddress;
+    preview.value = h
+      ? `registry_host: "${h}:${OFFLINE_LOCAL_REGISTRY_PORT}"\n` +
+        `files_repo: "http://${h}:${OFFLINE_LOCAL_NGINX_PORT}"\n` +
+        `ubuntu_repo: "http://${h}:${OFFLINE_LOCAL_APT_PORT}"\n` +
+        `debian_repo: "http://${h}:${OFFLINE_LOCAL_APT_PORT}"`
+      : "Enter a host address above to preview the values.";
+  }
+  hostInput.addEventListener("input", () => {
+    state.offlineForm.hostAddress = hostInput.value;
+    refreshPreview();
+  });
+  refreshPreview();
+
+  form.appendChild(opsField("This host's address, as reached from your cluster nodes", hostInput));
+  card.appendChild(form);
+  card.appendChild(preview);
+
+  const writeBtn = document.createElement("button");
+  writeBtn.className = "btn-primary";
+  writeBtn.style.marginTop = "10px";
+  writeBtn.textContent = "Write to offline.yml";
+  writeBtn.addEventListener("click", async () => {
+    const host = state.offlineForm.hostAddress;
+    if (!host) {
+      showToast("Enter a host address first.", "error");
+      return;
+    }
+    if (!confirm(`Write registry_host/files_repo/ubuntu_repo/debian_repo into inventory/${state.inventory}/group_vars/all/offline.yml, pointing at "${host}"?`)) return;
+    try {
+      await api(`/api/inventories/${state.inventory}/offline/configure`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ host_address: host }),
+      });
+      showToast("offline.yml updated.", "success");
+    } catch (e) {
+      showToast("Error: " + e.message, "error");
+    }
+  });
+  card.appendChild(writeBtn);
+
+  return card;
+}
+
 function renderOffline(data) {
   const wrap = document.createElement("div");
 
@@ -931,8 +1127,13 @@ function renderOffline(data) {
 
   const desc = document.createElement("div");
   desc.className = "file-desc";
-  desc.textContent = "Builds the exact commands to prepare every artifact kubespray needs for an air-gapped install of the currently checked-out version. Nothing runs automatically — copy each command and run it yourself where it says to.";
+  desc.textContent = "Prepares every artifact kubespray needs for an air-gapped install of the currently checked-out version. Generate lists, download files, and container images/OS packages can be run for real from here.";
   wrap.appendChild(desc);
+
+  const dangerBanner = document.createElement("div");
+  dangerBanner.className = "ops-note danger";
+  dangerBanner.textContent = "Running these here uses this host's real Docker daemon, via a socket mounted into the webui container - the webui can now start/stop/build anything on this machine. The webui itself has no login, so anyone who can reach it can do the same.";
+  wrap.appendChild(dangerBanner);
 
   const summary = document.createElement("div");
   summary.className = "ops-note";
@@ -978,6 +1179,105 @@ function renderOffline(data) {
       outputRow.appendChild(copyBtn);
       card.appendChild(outputRow);
 
+      if (stage.id === "container-images") {
+        const form = document.createElement("div");
+        form.className = "ops-fields";
+        form.style.marginTop = "12px";
+        form.style.marginBottom = "0";
+
+        const localRadio = document.createElement("input");
+        localRadio.type = "radio";
+        localRadio.name = "offlineRegistryMode";
+        localRadio.checked = state.offlineForm.registryMode === "local";
+        const remoteRadio = document.createElement("input");
+        remoteRadio.type = "radio";
+        remoteRadio.name = "offlineRegistryMode";
+        remoteRadio.checked = state.offlineForm.registryMode === "remote";
+        const addressInput = document.createElement("input");
+        addressInput.type = "text";
+        addressInput.placeholder = "registry.example.com:5000";
+        addressInput.value = state.offlineForm.registryAddress;
+        addressInput.disabled = state.offlineForm.registryMode !== "remote";
+
+        const refresh = () => { output.value = buildContainerImagesCommand(data.offline_dir); };
+        localRadio.addEventListener("change", () => { state.offlineForm.registryMode = "local"; addressInput.disabled = true; refresh(); });
+        remoteRadio.addEventListener("change", () => { state.offlineForm.registryMode = "remote"; addressInput.disabled = false; refresh(); });
+        addressInput.addEventListener("input", () => { state.offlineForm.registryAddress = addressInput.value; refresh(); });
+
+        form.appendChild(opsField("Start a local registry (localhost:5000)", localRadio));
+        form.appendChild(opsField("Use an existing registry", remoteRadio));
+        form.appendChild(opsField("Registry address", addressInput));
+        card.appendChild(form);
+      }
+
+      if (stage.id === "os-packages") {
+        const form = document.createElement("div");
+        form.className = "ops-fields";
+        form.style.marginTop = "12px";
+        form.style.marginBottom = "0";
+
+        const releaseInput = document.createElement("input");
+        releaseInput.type = "text";
+        releaseInput.value = state.offlineForm.ubuntuRelease;
+        releaseInput.addEventListener("input", () => {
+          state.offlineForm.ubuntuRelease = releaseInput.value;
+          output.value = buildOsPackagesCommand(data.offline_dir, data.host_offline_dir, stage.packages);
+        });
+        form.appendChild(opsField("Ubuntu release (target nodes)", releaseInput));
+        card.appendChild(form);
+      }
+
+      if (OFFLINE_RUNNABLE.has(stage.id)) {
+        const runRow = document.createElement("div");
+        runRow.style.marginTop = "10px";
+        const runBtn = document.createElement("button");
+        runBtn.className = "btn-primary";
+        runBtn.textContent = "▶ Run";
+
+        if (stage.id === "download-files" && !data.status.files_list.exists) {
+          runBtn.disabled = true;
+          runBtn.title = "Run \"Generate file & image lists\" first.";
+        }
+        if (stage.id === "container-images" && !data.status.images_list.exists) {
+          runBtn.disabled = true;
+          runBtn.title = "Run \"Generate file & image lists\" first.";
+        }
+        // Server-side run state (OFFLINE_STAGE_LOCKS in main.py), not just this
+        // tab's in-memory state - so a run started before a page refresh (or from
+        // another browser tab) still shows as running instead of a misleading
+        // fresh "▶ Run" button. renderOffline() re-polls below while this is true.
+        if (data.running[stage.id]) {
+          runBtn.disabled = true;
+          runBtn.textContent = "Running… (started elsewhere)";
+          runBtn.title = "A run of this stage is already in progress, possibly from before this page load - this will update on its own once it finishes.";
+        }
+
+        const logEl = document.createElement("pre");
+        logEl.className = "raw-editor ops-cmd-output offline-log";
+        // Prefer the server's copy (OFFLINE_STAGE_LOGS in main.py) over this tab's
+        // own in-memory state - the server's persists across a refresh and is
+        // visible from any tab, this tab's own state is neither.
+        const priorLog = (data.logs && data.logs[stage.id]) || state.offlineLogs[stage.id];
+        state.offlineLogs[stage.id] = priorLog || "";
+        logEl.textContent = priorLog || "";
+        logEl.style.display = priorLog ? "block" : "none";
+        logEl.style.marginTop = "10px";
+
+        runBtn.addEventListener("click", () => {
+          let body = {};
+          if (stage.id === "container-images") {
+            body = { registry_mode: state.offlineForm.registryMode, registry_address: state.offlineForm.registryAddress };
+          } else if (stage.id === "os-packages") {
+            body = { ubuntu_release: state.offlineForm.ubuntuRelease };
+          }
+          runOfflineStage(stage.id, body, logEl, runBtn);
+        });
+
+        runRow.appendChild(runBtn);
+        card.appendChild(runRow);
+        card.appendChild(logEl);
+      }
+
       if (stage.id === "helm-charts") {
         const form = document.createElement("div");
         form.className = "ops-fields";
@@ -1021,8 +1321,14 @@ function renderOffline(data) {
     wrap.appendChild(card);
   }
 
+  wrap.appendChild(renderOfflineConfigureCard());
+
   content.innerHTML = "";
   content.appendChild(wrap);
+
+  if (Object.values(data.running).some(Boolean)) {
+    setTimeout(() => pollOfflineRunning({ running: data.running, logs: data.logs }), 4000);
+  }
 }
 
 function renderVarRow(entry) {

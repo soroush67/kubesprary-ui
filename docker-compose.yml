@@ -5,8 +5,66 @@ services:
       - "8420:8420"
     volumes:
       - ../kubespray:/kubespray
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       - KUBESPRAY_ROOT=/kubespray
+      # Real host-side path to the kubespray checkout. Needed because `docker run -v`
+      # commands issued from inside this container (via the socket mount above) are
+      # resolved by the HOST's daemon against HOST paths, not this container's - so
+      # any bind-mount source built from KUBESPRAY_ROOT alone would silently mount an
+      # empty directory instead of the real checkout. See offline.py.
+      - HOST_KUBESPRAY_ROOT=/home/soroush/infra/kubespray
+    restart: unless-stopped
+
+  # These four are the "Offline / Air-gapped" tab's repos: permanent, always
+  # running, empty until the tab's Run buttons fill them in. They serve straight
+  # off the same host directories the webui downloads into, resolved by
+  # docker-compose itself against the host filesystem (unlike anything the webui
+  # container starts via its own `docker run` - see HOST_KUBESPRAY_ROOT above).
+  #
+  # All three mount their data straight onto /usr/share/nginx/html and override
+  # /etc/nginx/conf.d/default.conf (the exact path nginx:alpine's own stock config
+  # lives at) with nginx-autoindex.conf - mounting kubespray's own contrib/offline/
+  # nginx.conf at /etc/nginx/nginx.conf instead (the first thing tried here) does
+  # NOT work: that stock default.conf is still `include`'d alongside it and, for
+  # any request with a plain "Host: localhost" header (i.e. any browser/curl
+  # hitting these by IP or "localhost"), nginx picks IT over the intended config
+  # (more specific server_name: "localhost" beats kubespray's catch-all "_") -
+  # silently serving from the wrong root with no autoindex. Overriding
+  # default.conf directly sidesteps the conflict entirely.
+  offline-files:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ../kubespray/contrib/offline/offline-files:/usr/share/nginx/html:ro
+      - ./nginx-autoindex.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  offline-apt:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ../kubespray/contrib/offline/os-packages:/usr/share/nginx/html:ro
+      - ./nginx-autoindex.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  offline-pip:
+    image: nginx:alpine
+    ports:
+      - "8082:80"
+    volumes:
+      - ../kubespray/contrib/offline/pip-packages:/usr/share/nginx/html:ro
+      - ./nginx-autoindex.conf:/etc/nginx/conf.d/default.conf:ro
+    restart: unless-stopped
+
+  offline-registry:
+    image: registry:2
+    ports:
+      - "5000:5000"
+    volumes:
+      - offline_registry_data:/var/lib/registry
     restart: unless-stopped
 
   rustfs:
@@ -84,3 +142,4 @@ volumes:
   rustfs_data_2:
   rustfs_data_3:
   rustfs_logs:
+  offline_registry_data:

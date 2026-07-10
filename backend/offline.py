@@ -1,9 +1,12 @@
 """
-Read-only helpers for the "Offline Install" tab: detects the relevant
-container-runtime/CNI/helm settings for an inventory and builds the ordered
-list of copy-paste shell commands needed to prepare an air-gapped install of
-the currently checked-out kubespray version. Never executes anything itself -
-see CLAUDE.md ("Offline / air-gapped install") for why.
+Helpers for the "Offline Install" tab: detects the relevant
+container-runtime/CNI/helm settings for an inventory, builds the ordered list
+of shell commands needed to prepare an air-gapped install of the currently
+checked-out kubespray version, and (for generate-lists/download-files/
+container-images/os-packages) those same commands are actually executed by
+backend/main.py's streaming run endpoints via the docker-socket-mounted
+webui container - see CLAUDE.md ("Offline / air-gapped install") for the
+security trade-off that entails.
 """
 from __future__ import annotations
 
@@ -81,8 +84,12 @@ def artifact_status(kubespray_root: Path) -> dict:
         "offline_files_dir": _file_info(offline_dir / "offline-files"),
         "offline_files_archive": _file_info(offline_dir / "offline-files.tar.gz"),
         "container_images_archive": _file_info(offline_dir / "container-images.tar.gz"),
-        "pip_packages_dir": _file_info(offline_dir / "offline-files" / "pip-packages"),
-        "helm_charts_dir": _file_info(offline_dir / "offline-files" / "helm-charts"),
+        # NOT nested under offline-files/ - manage-offline-files.sh unconditionally
+        # `rm -rf`s that whole directory on every run, which would silently wipe
+        # these out if they lived inside it.
+        "pip_packages_dir": _file_info(offline_dir / "pip-packages"),
+        "helm_charts_dir": _file_info(offline_dir / "helm-charts"),
+        "os_packages_dir": _file_info(offline_dir / "os-packages"),
     }
 
 
@@ -92,7 +99,108 @@ def _inventory_file(inv_dir: Path) -> str:
     return found or candidates[-1]
 
 
-def build_plan(kubespray_root: Path, inv: str, inv_dir: Path, current_version: str, config: dict, status: dict) -> list[dict]:
+LOCAL_REGISTRY_PORT = 5000
+LOCAL_NGINX_PORT = 8080
+LOCAL_APT_PORT = 8081
+LOCAL_PIP_PORT = 8082
+
+
+def container_images_command(kubespray_root: Path, registry_mode: str, registry_address: str | None) -> str:
+    # manage-offline-container-images.sh's own "DESTINATION_REGISTRY unset" auto-setup
+    # path is unusable here: it resolves the address via `$(hostname)` (this
+    # container's own random ID, not anything reachable). So we always pass
+    # DESTINATION_REGISTRY explicitly - "local" means the permanent offline-registry
+    # compose service (docker-compose.yml), always running, port 5000 published to
+    # the host, so `localhost:5000` from the HOST daemon's perspective (this runs via
+    # the mounted socket) reaches it correctly. Plain HTTP push to a loopback address
+    # needs no daemon.json changes (Docker treats 127.0.0.0/8 as insecure by default).
+    offline_dir = kubespray_root / "contrib" / "offline"
+    dest = registry_address if (registry_mode == "remote" and registry_address) else f"localhost:{LOCAL_REGISTRY_PORT}"
+    return (
+        f"cd {offline_dir} && IMAGES_FROM_FILE={offline_dir}/temp/images.list "
+        f"./manage-offline-container-images.sh create && "
+        f"DESTINATION_REGISTRY={dest} ./manage-offline-container-images.sh register"
+    )
+
+
+def download_files_command(kubespray_root: Path) -> str:
+    # manage-offline-files.sh unconditionally `rm -rf`s offline-files/ before every
+    # run, which is actively dangerous now that this can be triggered from a browser
+    # button: two clicks (or a click landing while a previous run is still going)
+    # race each other, and the second one's rm -rf wipes out everything the first
+    # one already downloaded (observed in practice - a run at 8/24 files got reset
+    # to 0% by a second click). So we don't call that script at all; instead a plain
+    # loop with `wget -c` (resume-if-partial, skip-if-already-complete - verified by
+    # content-length, not a real checksum, which kubespray's own generated
+    # files.list doesn't carry) so re-running - accidentally or deliberately - is
+    # cheap and never destroys prior progress. Nothing needs to be started to serve
+    # this - the permanent offline-files compose service already mounts this same
+    # directory.
+    #
+    # `echo inet4only=on > ~/.wgetrc` forces wget onto IPv4: this host's IPv6 route
+    # hangs (rather than failing fast) on several of the download hosts, so without
+    # it every URL pays a long timeout before falling back to IPv4.
+    offline_dir = kubespray_root / "contrib" / "offline"
+    files_dir = offline_dir / "offline-files"
+    return (
+        f"echo 'inet4only = on' > ~/.wgetrc && "
+        f"mkdir -p {files_dir} && "
+        f"while read -r url; do [ -n \"$url\" ] && wget -c -x -P {files_dir} \"$url\"; done "
+        f"< {offline_dir}/temp/files.list && "
+        f"tar -czf {offline_dir}/offline-files.tar.gz -C {offline_dir} offline-files"
+    )
+
+
+def os_packages_command(kubespray_root: Path, host_kubespray_root: Path, ubuntu_release: str, config: dict) -> str:
+    # Downloading the .debs alone isn't enough - apt needs a real repository index
+    # (Packages.gz) to point ubuntu_repo/debian_repo at, not a bare folder of files.
+    # dpkg-scanpackages (installed in the Dockerfile) builds a flat-repo index
+    # locally - no DooD issue, it's a plain read/write through our own bind-mounted
+    # filesystem view, not a `docker run -v`. Only the apt-get step itself needs a
+    # throwaway container (to genuinely match the target Ubuntu release, not this
+    # webui's own Debian base) - that one still needs host_kubespray_root for its
+    # `-v`, since it's a real ad-hoc `docker run` via the socket. Nothing needs to be
+    # started to serve the result - the permanent offline-apt compose service
+    # already mounts this same directory.
+    offline_dir = kubespray_root / "contrib" / "offline"
+    outdir = offline_dir / "os-packages"
+    host_outdir = host_kubespray_root / "contrib" / "offline" / "os-packages"
+    packages = list(BASE_OS_PACKAGES)
+    if config["container_manager"] == "docker":
+        packages += ["docker-ce", "docker-ce-cli", "containerd.io"]
+    return (
+        f"mkdir -p {outdir} && docker run --rm -v {host_outdir}:/var/cache/apt/archives "
+        f'ubuntu:{ubuntu_release} bash -c "apt-get update -q && apt-get install --download-only -y {" ".join(packages)}" && '
+        f"cd {outdir} && dpkg-scanpackages . /dev/null 2>/dev/null | gzip -9c > Packages.gz"
+    )
+
+
+def pip_packages_command(kubespray_root: Path) -> str:
+    # Runs directly in the webui container - no throwaway-container wrapping needed
+    # the way os-packages has, since these are control-node/ansible dependencies
+    # (whatever machine runs ansible-playbook), not target-node binaries, so there's
+    # no "must match target OS" concern. Nothing needs to be started to serve the
+    # result - the permanent offline-pip compose service (with autoindex on, so
+    # `pip install --find-links=...` can parse the directory listing) already
+    # mounts this same directory.
+    offline_dir = kubespray_root / "contrib" / "offline"
+    outdir = offline_dir / "pip-packages"
+    return f"mkdir -p {outdir} && pip download --no-cache-dir -r {kubespray_root}/requirements.txt -d {outdir}"
+
+
+def offline_yml_updates(host_address: str) -> dict:
+    # The 4 values kubespray's offline.yml needs to point the REAL target k8s nodes
+    # (separate machines) at these repos. Deliberately NOT localhost - that's only
+    # correct for the push step above, which runs locally via the Docker socket.
+    return {
+        "registry_host": {"enabled": True, "value": f'"{host_address}:{LOCAL_REGISTRY_PORT}"'},
+        "files_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_NGINX_PORT}"'},
+        "ubuntu_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_APT_PORT}"'},
+        "debian_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_APT_PORT}"'},
+    }
+
+
+def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_dir: Path, current_version: str, config: dict, status: dict) -> list[dict]:
     offline_dir = kubespray_root / "contrib" / "offline"
     inventory_arg = f"inventory/{inv}/{_inventory_file(inv_dir)}"
 
@@ -104,9 +212,7 @@ def build_plan(kubespray_root: Path, inv: str, inv_dir: Path, current_version: s
         "relevant": True,
         "note": (
             "Renders files.list and images.list for the currently checked-out "
-            f"kubespray version ({current_version}) and this inventory's settings. "
-            "Must run wherever ansible-playbook for this checkout normally runs "
-            "(this box's shell, not the webui container - it has no ansible-playbook)."
+            f"kubespray version ({current_version}) and this inventory's settings."
         ),
         "command": f"cd {kubespray_root} && ./contrib/offline/generate_list.sh -i {inventory_arg}",
     })
@@ -116,32 +222,30 @@ def build_plan(kubespray_root: Path, inv: str, inv_dir: Path, current_version: s
         "title": "Download static files & serve local mirror",
         "relevant": True,
         "note": (
-            "Downloads every URL in files.list and starts a local nginx container "
-            "serving them on :8080. Needs wget and one of docker/podman/nerdctl "
-            "plus sudo. Safe to re-run, but always re-downloads everything (no resume)."
+            "Downloads every URL in files.list. Served on :8080 by the always-on "
+            "offline-files service (docker-compose.yml) - nothing to start. Safe "
+            "to re-run - already-complete files are skipped and partial ones "
+            "resumed (by size, not a real checksum: kubespray's own files.list "
+            "doesn't carry expected hashes)."
         ),
-        "command": f"cd {offline_dir} && ./manage-offline-files.sh",
+        "command": download_files_command(kubespray_root),
     })
 
     stages.append({
         "id": "container-images",
-        "title": "Pull & package container images",
+        "title": "Pull & push container images to a registry",
         "relevant": True,
         "note": (
-            "Step 1 (run where the images list is available, no live cluster needed "
-            "thanks to IMAGES_FROM_FILE) saves every image in images.list to a tar. "
-            "Step 2 (run in the air-gapped environment, on the box that will host "
-            "the local registry) loads and pushes them - it OVERWRITES "
-            "/etc/docker/daemon.json or /etc/containers/registries.conf on whatever "
-            "host runs it, unconditionally, and needs sudo. Review before running."
+            "Pulls every image in images.list and pushes it to a registry - by "
+            f"default the always-on offline-registry service (port {LOCAL_REGISTRY_PORT}, "
+            "docker-compose.yml), or an existing registry you specify. A "
+            "non-loopback remote registry serving plain HTTP would need "
+            "insecure-registries configured on the HOST's own Docker daemon "
+            "separately - this tool won't do that for you. Once it's done, use "
+            "the \"Point kubespray at these repos\" card below to write the "
+            "address into offline.yml."
         ),
-        "command": (
-            f"cd {offline_dir} && IMAGES_FROM_FILE={offline_dir}/temp/images.list "
-            "./manage-offline-container-images.sh create\n\n"
-            "# --- then, in the air-gapped environment ---\n"
-            f"cd {offline_dir} && DESTINATION_REGISTRY=<registry-host>:5000 "
-            "./manage-offline-container-images.sh register"
-        ),
+        "command": container_images_command(kubespray_root, "local", None),
     })
 
     stages.append({
@@ -150,9 +254,14 @@ def build_plan(kubespray_root: Path, inv: str, inv_dir: Path, current_version: s
         "relevant": True,
         "note": (
             "Only needed if the control node running ansible-playbook won't have "
-            "internet access either. Downloads kubespray's own requirements.txt."
+            "internet access either. Downloads kubespray's own requirements.txt, "
+            f"served on :{LOCAL_PIP_PORT} by the always-on offline-pip service - "
+            f"use `pip install --find-links=http://<this-host>:{LOCAL_PIP_PORT}/ "
+            "<package>` on the control node. Not written into offline.yml - "
+            "kubespray has no group_var for the control node's own pip index, "
+            "this is a separate concern from the target-node repos above."
         ),
-        "command": f"pip download -r {kubespray_root}/requirements.txt -d {offline_dir}/offline-files/pip-packages",
+        "command": pip_packages_command(kubespray_root),
     })
 
     os_packages = list(BASE_OS_PACKAGES)
@@ -160,16 +269,24 @@ def build_plan(kubespray_root: Path, inv: str, inv_dir: Path, current_version: s
         os_packages += ["docker-ce", "docker-ce-cli", "containerd.io"]
     stages.append({
         "id": "os-packages",
-        "title": "OS packages (Debian/Ubuntu, best-effort)",
+        "title": "OS packages (Ubuntu)",
         "relevant": True,
         "note": (
-            "Best-effort baseline list, NOT derived from this kubespray version's "
-            "actual role defaults (those are Jinja-templated per-version/per-OS in "
-            "roles/container-engine/docker/vars/*.yml and would need a live ansible "
-            "run to resolve exactly) - cross-check before relying on it for a real "
-            "air-gapped install."
+            "Downloads real .deb files (with dependencies) for a curated baseline "
+            "package list, inside a throwaway ubuntu:<release> container so they "
+            "genuinely match your target nodes' Ubuntu release - NOT the webui "
+            "container's own Debian base. Then builds a real flat apt repository "
+            "index (Packages.gz via dpkg-scanpackages) and serves it on "
+            f":{LOCAL_APT_PORT} - point ubuntu_repo at this host and use "
+            f"'deb [trusted=yes] http://<this-host>:{LOCAL_APT_PORT}/ ./' as the "
+            "apt source line on target nodes (unsigned - fine for an internal "
+            "mirror, not for public exposure). The package list itself is still a "
+            "best-effort baseline, not derived from this kubespray version's "
+            "actual Jinja-templated role defaults - cross-check before relying on "
+            "it for a real air-gapped install."
         ),
-        "command": f"apt-get install --download-only -y {' '.join(os_packages)}",
+        "command": os_packages_command(kubespray_root, host_kubespray_root, "24.04", config),
+        "packages": os_packages,
     })
 
     helm_relevant = config["helm_enabled"] or config["kube_network_plugin"] == "cilium"
@@ -190,7 +307,7 @@ def build_plan(kubespray_root: Path, inv: str, inv_dir: Path, current_version: s
         "command": (
             f"helm repo add cilium https://helm.cilium.io/ && helm repo update && "
             f"helm pull cilium/cilium --version {cilium_version} "
-            f"--destination {offline_dir}/offline-files/helm-charts"
+            f"--destination {offline_dir}/helm-charts"
         ),
     })
 
