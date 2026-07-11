@@ -74,14 +74,14 @@ unchanged in shape from the old horizontal version.
    Currently one card: **run Molecule against a kubespray role**
    (`adduser`, `bastion-ssh-config`). See "Ansible Molecule tab — Molecule
    role tests" below for full design/gotchas.
-6. **Installation** — placeholder, not built yet. Originally this feature
-   was requested as part of the "Installation" tab (with Molecule as its
-   first sub-option), but the user later explicitly split them into two
-   separate nav items — Ansible Molecule and Installation — with
-   Installation kept as the **last** nav item and its own distinct, not-yet-
-   specified purpose (presumably the real cluster install, i.e. running
-   kubespray's own `cluster.yml`, as distinct from role-level testing) —
-   don't invent what goes here, ask when it comes up.
+6. **Installation** — real cluster install: `ansible-playbook cluster.yml`
+   against the selected inventory's hosts, not a command builder. Confirmed
+   with the user this is the real install (not a command builder like
+   Cluster Operations). Inventory-scoped, real execution, with a
+   server-side confirmation gate (not just a JS `confirm()`) since it
+   installs actual Kubernetes components with no undo short of
+   `reset.yml`. See "Installation tab — real cluster install" below for
+   full design.
 
 ## etcd backup feature
 
@@ -136,17 +136,20 @@ installs a systemd timer + script on etcd nodes for periodic
 
 - `3761878` Initial commit, `6a22128` "Add Kubespray Version and Offline
   Install tabs" (command-builder-only version), `5ee8ea6` "Offline Install:
-  real execution, permanent repos, offline.yml write" — all three pushed to
-  `origin/main`.
-- **Uncommitted, not pushed**: the vertical sidebar nav + new Ansible
-  Molecule tab (real Molecule role tests) + an empty placeholder
-  Installation tab (split out from Molecule per the user's request, kept
-  last, content TBD) — touches `Dockerfile`, `backend/main.py`, new
-  `backend/molecule_runner.py`, `static/index.html`, `static/app.js`,
-  `static/styles.css`, new `molecule/` directory, `CLAUDE.md`. Both roles
-  (`adduser`, `bastion-ssh-config`) verified working end-to-end — see
-  "Ansible Molecule tab — Molecule role tests" below — ask before
-  committing/pushing.
+  real execution, permanent repos, offline.yml write", `a72ee8e` "Vertical
+  sidebar nav; add Ansible Molecule tab for real kubespray role tests" —
+  all four pushed to `origin/main`.
+- **Uncommitted, not pushed**: the Installation tab's real implementation
+  (`ansible-playbook cluster.yml` against the selected inventory, with a
+  server-side confirmation gate) — touches `Dockerfile`, `backend/main.py`,
+  `backend/offline.py` (renamed `_inventory_file` → `inventory_file`, now
+  shared across modules), `static/app.js`, `CLAUDE.md`. Real end-to-end run
+  tested against the `soroush` inventory (real IPs, not yet provisioned -
+  see "Installation tab" verification status below for full detail and why
+  `local` was deliberately avoided) - found and fixed 3 real bugs this way
+  (missing `community.general` etc., wrong ansible-core version, a lock
+  KeyError). See "Installation tab —
+  real cluster install" below — ask before committing/pushing.
 - Reminder for next session: the `webui` container bakes `backend`/`static`
   into the image via `COPY` at build time — it does **not** live-reload.
   After any backend/static edit, `docker-compose build webui &&
@@ -535,3 +538,176 @@ Python - pip alone isn't enough.
   `roles/bastion-ssh-config/molecule/default/` during the run (proves the
   copied-not-referenced `converge.yml` decision in gotcha #6 avoided
   cross-contamination as intended).
+
+## Installation tab — real cluster install — reference notes
+
+Runs the real, un-limited `ansible-playbook -i inventory/<inv>/<file>
+cluster.yml -b -v` against whichever inventory is currently selected -
+kubespray's actual first-time cluster bootstrap, as distinct from Cluster
+Operations' add/remove/reset/scale (which target an *existing* cluster) and
+Ansible Molecule (which tests one role in isolation, not a real cluster).
+Confirmed with the user this should be **real execution**, not a command
+builder like Cluster Operations - the third variant of "how consequential
+should this tab be" this codebase now has (builder-only / real-but-sandboxed
+via Docker / real-and-unsandboxed against whatever the inventory points at).
+
+**Inventory-scoped, unlike Molecule/Offline Install**: `INSTALLATION_LOCKS`/
+`INSTALLATION_LOGS` (`backend/main.py`) are keyed by inventory name, created
+on first use via `_installation_lock(inv)` rather than pre-populated at
+startup - inventories are created dynamically (the "+ New" button), so
+there's no fixed set of keys to know in advance, unlike
+`OFFLINE_STAGE_LOCKS`/`MOLECULE_LOCKS`.
+
+**Server-side confirmation gate, not just a JS `confirm()`**: `POST
+/api/inventories/{inv}/installation/run` 400s unless the request body has
+`confirm: true` (`InstallPayload`). This is a genuinely irreversible-ish
+action - it installs real Kubernetes components (containerd, kubelet,
+etcd, control plane, etc.) on every host the target inventory points at,
+with no undo short of running `reset.yml` against the same hosts - so the
+gate lives in the API itself, in addition to the frontend's own
+`confirm()` dialog before it even sends the request. Matches the project's
+established "real-execution safety pattern" (see Git state section above)
+of not trusting a single client-side check for anything with real
+consequences.
+
+`offline.py`'s `_inventory_file()` was renamed to `inventory_file()` (no
+leading underscore) since it's now called from `main.py` too (for the
+`cluster.yml` command's `-i` path), not just internally within
+`offline.py`'s own `build_plan()`.
+
+**Auth options**: SSH user override (`-u`) plus a Password/Public key
+choice, added per explicit user request so real, differently-configured
+hosts (mixed `ansible_user`s, no keys set up yet) can actually be reached.
+"Public key" relies on the `webui` container's own mounted `SSH_DIR`
+(`docker-compose.yml` - same key(s) `backup-sync` already uses); "Password"
+sends `-e ansible_ssh_pass=... -e ansible_become_pass=...` instead of
+`-k`/`-K` (which prompt interactively on stdin - incompatible with this
+project's streaming-subprocess model, which only reads stdout/stderr).
+Validated server-side (`_validate_auth()`): `ssh_user` must match
+`SSH_USER_RE`, `auth_method` must be one of the two values, and a password
+is required when `auth_method == "password"` - `ssh_user`/`ssh_password`
+get `shlex.quote()`'d before going into the shell command
+(`_stream_shell` runs via `asyncio.create_subprocess_shell`, a real shell -
+unescaped user input there would be a shell-injection vector). The command
+preview textarea masks the password as `***` (`buildInstallationCommand()`
+in `app.js`) while the real run uses the actual value - **known exposure**:
+the real password is still visible via `ps`/`docker top` inside the `webui`
+container while a run is in flight, consistent with this project's already-
+documented "webui has no login, root-equivalent DooD access" risk tier.
+
+**Check connectivity button**: a separate, read-only `ansible -m ping`
+action (`POST /api/inventories/{inv}/installation/check-connectivity`),
+reusing the same auth fields as the real install so the user can verify
+SSH/become auth works *before* committing to a real `cluster.yml` run.
+Own lock/log dict (`CONNECTIVITY_LOCKS`/`CONNECTIVITY_LOGS`, same
+per-inventory dynamic-creation shape as `INSTALLATION_LOCKS`) so a
+connectivity check never blocks on, or is blocked by, a real install run -
+both can be polled/restored independently via the same `/plan` endpoint
+(`connectivity_running`/`connectivity_log` alongside `running`/`log`).
+Added directly in response to a real debugging session: this is exactly
+the check that found the `afshin` inventory's `worker3` had a different
+`ansible_user`/password than the other 5 hosts - having a UI button for it
+means that kind of check no longer needs a manual `docker exec ... ansible
+-m ping` from the terminal.
+
+**Why `local` was deliberately avoided for real-run testing**: `local` is
+`ansible_connection=local` (single all-in-one node) - the target host **is
+this machine**, so a real run would install actual Kubernetes components
+(containerd, kubelet, etcd, Calico, which reconfigures iptables/routes)
+directly on the user's real system, which also runs Docker for several
+other active projects (this webui, compose-platform, glowbook, etc.) -
+real risk of disrupting those via a containerd reconfiguration. Tested
+against `soroush` instead (2 hosts, real IPs `10.10.10.1`/`.2`, not yet
+provisioned/reachable) - genuinely safer: any real SSH connection attempt
+would just fail cleanly, so this only risks the `webui` container's own
+local ansible process, never touches this host's real state or any other
+system.
+
+### Gotchas found (all fixed) — found by actually running a real `cluster.yml`, not by inspection
+
+1. **Missing `community.general` (and kubespray's other bundled Ansible
+   collections).** `roles/kubernetes/preinstall`'s NetworkManager DNS task
+   uses `community.general.ini_file`, which the webui image didn't have -
+   it only had `ansible-core` + the 2 collections Molecule needed
+   (`community.docker`, `ansible.posix`). Fixed by installing the full
+   `ansible` pip metapackage instead of bare `ansible-core` - it bundles a
+   large pinned set of community collections (matches how kubespray's own
+   `Dockerfile` does it: `pip install -r requirements.txt` with
+   `ansible==X.Y.Z`, not `ansible-core`).
+2. **Wrong ansible-core version once the full `ansible` package was
+   unpinned.** `playbooks/ansible_version.yml`'s own preflight assertion
+   hard-fails outside kubespray's exact supported range - installing
+   unpinned `ansible` pulled ansible-core 2.21.1, but kubespray v2.31.0
+   requires `2.18.0 <= version < 2.19.0`. Fixed by pinning
+   `ansible==11.13.0` in the Dockerfile, matching the version kubespray's
+   own `requirements.txt` pins **for the currently checked-out tag**.
+   **Known limitation**: if the Kubespray Version tab switches to a
+   different tag with a different `requirements.txt` pin, the webui image
+   may need rebuilding with a matching version - there's no automatic
+   sync between "which kubespray tag is checked out" and "what's baked
+   into the webui image," since the image builds independently of which
+   tag happens to be checked out at build time.
+3. **Missing `netaddr`/`cryptography`/`jmespath` (kubespray's other 3
+   `requirements.txt` pins).** Found one at a time by actually running:
+   `ansible.utils.ipaddr` (needs `netaddr`) failed on
+   "Check that python netaddr is installed" next. kubespray's own
+   `requirements.txt` can't be `COPY`'d at build time (it only exists via
+   the `/kubespray` bind mount at container *runtime*, not in the build
+   context) - fixed by mirroring its 4 pins by hand in the Dockerfile
+   (`ansible`, `cryptography`, `jmespath`, `netaddr`), same
+   known-limitation caveat as gotcha #2 if the checked-out tag's
+   `requirements.txt` ever changes these.
+4. **`run_installation()` 500'd with a raw `KeyError` if called before
+   `installation_plan()` for that inventory.** Only the `GET .../plan`
+   endpoint called `_installation_lock(inv)` (which creates the dict entry
+   on first use); `POST .../run` went straight to `_check_not_running(inv,
+   INSTALLATION_LOCKS)`, which does a bare `locks[key]` lookup - a
+   `KeyError`, not the intended clean 409, for any inventory whose `/plan`
+   hadn't been hit yet in this process's lifetime (hit this directly after
+   a container restart wiped the in-memory dicts). Fixed by also calling
+   `_installation_lock(inv)` at the top of `run_installation()`.
+
+### Verification status (2026-07-11)
+
+Full real-execution pipeline confirmed working end-to-end via direct
+`curl` against `soroush` (2 real-IP hosts, not yet provisioned/reachable -
+see above for why this inventory, not `local`): after the 4 fixes above, a
+genuine `ansible-playbook cluster.yml` subprocess ran to completion of its
+preflight stage - version check passed (`ansible-core 2.18.18`), netaddr/
+jinja checks passed, `dynamic_groups`/`validate_inventory` roles ran and
+correctly manipulated real in-memory group membership - then failed
+cleanly with `"Group 'etcd' cannot be empty in external etcd mode"`. That
+last failure is a **real inventory configuration issue** in `soroush`
+(its `inventory.yml` has `etcd: {hosts: {}}`, empty) - not a webui bug;
+this stopped before any task that would need real SSH connectivity to the
+(unreachable) target hosts, so nothing on this host or any remote system
+was touched. Also confirmed: `GET .../plan` returns the correct command
+per-inventory, `POST .../run` 400s without `confirm: true`, and unknown
+inventories 404. Going further (actually reaching a real SSH connection
+attempt, or a real successful `cluster.yml` completion) needs either
+fixing `soroush`'s/`afshin`'s empty `etcd` group (their choice, not
+invented here) or genuinely reachable target hosts - neither exists yet
+in this environment.
+
+**Update**: `afshin` was subsequently updated by the user with 6 real,
+reachable LAN hosts (`192.168.120.160-165`, stacked etcd on the 3
+`kube_control_plane` hosts) and a real SSH password. The new "Check
+connectivity" button/endpoint was verified for real against all 6 hosts -
+`ansible -m ping` with `ssh_user=soroush, auth_method=password,
+ssh_password=<redacted>` returns `pong` from all 6 (confirmed via direct `curl`
+against `POST .../installation/check-connectivity`, and via the
+`GET .../plan` endpoint's `connectivity_log` correctly persisting the
+result). One real bug found and fixed along the way in `afshin` itself
+(not a webui bug): `worker3` originally had `ansible_user: devops` while
+the other 5 hosts had `soroush`, with a password that only matched
+`soroush` - fixed by the user changing `worker3`'s `ansible_user` to
+`soroush` to match. The `-u` override (added specifically to let the user
+force a uniform SSH user across a mixed inventory) was tested during
+diagnosis and confirmed working, though the actual fix ended up being in
+the inventory itself rather than needing the override at all.
+
+**Still not run**: an actual full `cluster.yml` install against `afshin` -
+connectivity is now fully confirmed, so this is the next real milestone,
+but it's a large, hard-to-fully-undo action (installs Kubernetes across 6
+real machines) - don't trigger it without the user explicitly asking for
+that specific step.

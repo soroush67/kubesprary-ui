@@ -93,7 +93,7 @@ def artifact_status(kubespray_root: Path) -> dict:
     }
 
 
-def _inventory_file(inv_dir: Path) -> str:
+def inventory_file(inv_dir: Path) -> str:
     candidates = ["inventory.yml", "inventory.yaml", "hosts.yaml", "hosts.ini", "inventory.ini"]
     found = next((f for f in candidates if (inv_dir / f).is_file()), None)
     return found or candidates[-1]
@@ -202,7 +202,7 @@ def offline_yml_updates(host_address: str) -> dict:
 
 def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_dir: Path, current_version: str, config: dict, status: dict) -> list[dict]:
     offline_dir = kubespray_root / "contrib" / "offline"
-    inventory_arg = f"inventory/{inv}/{_inventory_file(inv_dir)}"
+    inventory_arg = f"inventory/{inv}/{inventory_file(inv_dir)}"
 
     stages = []
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -35,6 +36,7 @@ BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,200}$")
 REGISTRY_ADDR_RE = re.compile(r"^[A-Za-z0-9.-]+(:[0-9]{1,5})?$")
 UBUNTU_RELEASE_RE = re.compile(r"^[0-9]{2}\.[0-9]{2}$")
 HOST_ADDR_RE = re.compile(r"^[A-Za-z0-9.-]+$")
+SSH_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,31}$")
 
 # Friendly labels/groups for the known kubespray group_vars files.
 FILE_META = {
@@ -553,6 +555,115 @@ def configure_offline_yml(inv: str, payload: OfflineConfigurePayload):
     new_text = new_parsed.to_text()
     target.write_text(new_text)
     return {"path": "all/offline.yml", "raw": new_text}
+
+
+# --- Installation tab: real cluster install (`ansible-playbook cluster.yml`).
+# Inventory-scoped (unlike Molecule/Offline Install) - a cluster install is
+# inherently tied to one specific inventory's hosts. Locks/logs are keyed by
+# inventory name, created on first use (inventories are created dynamically
+# via the "+ New" button, so there's no fixed set to pre-populate at startup
+# the way OFFLINE_STAGE_LOCKS/MOLECULE_LOCKS can).
+INSTALLATION_LOCKS: dict[str, asyncio.Lock] = {}
+INSTALLATION_LOGS: dict[str, str] = {}
+
+
+def _installation_lock(inv: str) -> asyncio.Lock:
+    if inv not in INSTALLATION_LOCKS:
+        INSTALLATION_LOCKS[inv] = asyncio.Lock()
+        INSTALLATION_LOGS[inv] = ""
+    return INSTALLATION_LOCKS[inv]
+
+
+class InstallPayload(BaseModel):
+    confirm: bool = False
+    ssh_user: str | None = None
+    auth_method: str = "publickey"  # "publickey" | "password"
+    ssh_password: str | None = None
+
+
+def _validate_auth(payload: InstallPayload) -> None:
+    if payload.auth_method not in ("publickey", "password"):
+        raise HTTPException(400, "Invalid auth method.")
+    if payload.ssh_user and not SSH_USER_RE.match(payload.ssh_user):
+        raise HTTPException(400, "Invalid SSH user.")
+    if payload.auth_method == "password" and not payload.ssh_password:
+        raise HTTPException(400, "Password required for password auth.")
+
+
+def _auth_flags(payload: InstallPayload) -> str:
+    flags = ""
+    if payload.ssh_user:
+        flags += f" -u {shlex.quote(payload.ssh_user)}"
+    if payload.auth_method == "password":
+        # -k/-K (--ask-pass/--ask-become-pass) prompt interactively on stdin,
+        # which this streaming subprocess (asyncio.create_subprocess_shell,
+        # stdout/stderr only) has no path to answer - -e ansible_ssh_pass/
+        # ansible_become_pass gets the same non-interactive password auth
+        # without needing to wire up stdin writes.
+        pw = shlex.quote(payload.ssh_password)
+        flags += f" -e ansible_ssh_pass={pw} -e ansible_become_pass={pw}"
+    return flags
+
+
+# Read-only "Check connectivity" (ansible -m ping) - lets the user verify SSH/
+# become auth for an inventory before committing to a real cluster.yml run.
+# Separate lock/log dict from INSTALLATION_LOCKS (same key-per-inventory shape)
+# so a connectivity check never blocks on, or is blocked by, a real install run.
+CONNECTIVITY_LOCKS: dict[str, asyncio.Lock] = {}
+CONNECTIVITY_LOGS: dict[str, str] = {}
+
+
+def _connectivity_lock(inv: str) -> asyncio.Lock:
+    if inv not in CONNECTIVITY_LOCKS:
+        CONNECTIVITY_LOCKS[inv] = asyncio.Lock()
+        CONNECTIVITY_LOGS[inv] = ""
+    return CONNECTIVITY_LOCKS[inv]
+
+
+@app.get("/api/inventories/{inv}/installation/plan")
+def installation_plan(inv: str):
+    inv_dir = _inventory_dir(inv)
+    lock = _installation_lock(inv)
+    conn_lock = _connectivity_lock(inv)
+    command = f"ansible-playbook -i inventory/{inv}/{off.inventory_file(inv_dir)} cluster.yml -b -v"
+    return {
+        "command": command, "running": lock.locked(), "log": INSTALLATION_LOGS[inv],
+        "connectivity_running": conn_lock.locked(), "connectivity_log": CONNECTIVITY_LOGS[inv],
+    }
+
+
+@app.post("/api/inventories/{inv}/installation/check-connectivity")
+def check_connectivity(inv: str, payload: InstallPayload):
+    inv_dir = _inventory_dir(inv)
+    _validate_auth(payload)
+    _connectivity_lock(inv)
+    lock = _check_not_running(inv, CONNECTIVITY_LOCKS)
+    command = f"ansible -i inventory/{inv}/{off.inventory_file(inv_dir)} all -m ping -e host_key_checking=False"
+    command += _auth_flags(payload)
+    return StreamingResponse(
+        _stream_shell(command, KUBESPRAY_ROOT, lock, inv, CONNECTIVITY_LOGS),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/installation/run")
+def run_installation(inv: str, payload: InstallPayload):
+    inv_dir = _inventory_dir(inv)
+    # This installs real Kubernetes components on whatever hosts this inventory
+    # points at - there's no undo short of running reset.yml. A stray click (or
+    # an automated retry) doing this by accident would be a real problem, so
+    # the confirmation gate lives here server-side, not just as a JS confirm().
+    if not payload.confirm:
+        raise HTTPException(400, "Confirmation required to run a real cluster install.")
+    _validate_auth(payload)
+    _installation_lock(inv)
+    lock = _check_not_running(inv, INSTALLATION_LOCKS)
+    command = f"ansible-playbook -i inventory/{inv}/{off.inventory_file(inv_dir)} cluster.yml -b -v"
+    command += _auth_flags(payload)
+    return StreamingResponse(
+        _stream_shell(command, KUBESPRAY_ROOT, lock, inv, INSTALLATION_LOGS),
+        media_type="text/plain",
+    )
 
 
 # --- Ansible Molecule tab: real Molecule role tests (Docker driver,

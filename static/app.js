@@ -109,7 +109,7 @@ async function switchTab(tab) {
   } else if (tab === "molecule") {
     await loadMolecule();
   } else if (tab === "installation") {
-    renderInstallationPlaceholder();
+    await loadInstallation();
   } else {
     renderSidebar();
     if (state.currentPath === HOSTS_VIEW) {
@@ -1482,15 +1482,295 @@ function renderMolecule(data) {
   }
 }
 
-// ---------- Installation (real cluster install - not yet defined) ----------
-// Separate from Ansible Molecule (role-level tests) per the user's explicit
-// split. Content TBD - don't invent what goes here until specified.
-function renderInstallationPlaceholder() {
-  content.innerHTML = `
-    <div class="empty-state">
-      <p>Installation</p>
-      <p class="path">Not configured yet.</p>
-    </div>`;
+// ---------- Installation (real cluster install: ansible-playbook cluster.yml) ----------
+// Separate from Ansible Molecule (role-level tests, not inventory-scoped) per
+// the user's explicit split - this one installs Kubernetes for real onto
+// whatever hosts the selected inventory points at. Inventory-scoped, unlike
+// Molecule; structurally mirrors the Offline Install tab's run/poll/log
+// pattern otherwise.
+
+if (!state.installationLog) {
+  state.installationLog = "";
+}
+if (!state.connectivityLog) {
+  state.connectivityLog = "";
+}
+if (!state.installationForm) {
+  // authMethod "publickey" relies on the webui container's own mounted SSH_DIR
+  // (same key(s) the backup-sync service already uses) reaching these hosts -
+  // "password" sends -e ansible_ssh_pass/ansible_become_pass instead (see
+  // main.py's run_installation - -k/-K would prompt interactively, which this
+  // streamed-subprocess model has no way to answer).
+  state.installationForm = { sshUser: "", authMethod: "publickey", sshPassword: "" };
+}
+
+// Mirrors run_installation()'s command construction so the preview stays
+// truthful while the user edits fields - the real run always goes through
+// the backend builder with the real password; this just masks it for display.
+function buildInstallationCommand(baseCommand) {
+  const f = state.installationForm;
+  let cmd = baseCommand;
+  if (f.sshUser) cmd += ` -u ${f.sshUser}`;
+  if (f.authMethod === "password") {
+    cmd += ` -e ansible_ssh_pass=*** -e ansible_become_pass=***`;
+  }
+  return cmd;
+}
+
+async function loadInstallation() {
+  content.innerHTML = `<div class="empty-state"><p>Checking installation status…</p></div>`;
+  try {
+    const data = await api(`/api/inventories/${state.inventory}/installation/plan`);
+    renderInstallation(data);
+  } catch (e) {
+    content.innerHTML = "";
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+async function pollInstallationRunning(previousSnapshot) {
+  if (state.topTab !== "installation") return;
+  try {
+    const freshData = await api(`/api/inventories/${state.inventory}/installation/plan`);
+    const snapshot = {
+      running: freshData.running, log: freshData.log,
+      connectivity_running: freshData.connectivity_running, connectivity_log: freshData.connectivity_log,
+    };
+    const changed = JSON.stringify(snapshot) !== JSON.stringify(previousSnapshot);
+    if (changed) {
+      renderInstallation(freshData);
+    } else if (freshData.running || freshData.connectivity_running) {
+      setTimeout(() => pollInstallationRunning(snapshot), 4000);
+    }
+  } catch (e) {
+    // Transient - the next manual tab switch/reload will surface real errors.
+  }
+}
+
+async function runConnectivityCheck(logEl, btn) {
+  const f = state.installationForm;
+  if (f.authMethod === "password" && !f.sshPassword) {
+    showToast("Enter a password, or switch to Public key auth.", "error");
+    return;
+  }
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Checking…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.connectivityLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/installation/check-connectivity`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ssh_user: f.sshUser || null,
+        auth_method: f.authMethod,
+        ssh_password: f.authMethod === "password" ? f.sshPassword : null,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.connectivityLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    showToast("Connectivity check finished - see the log for per-host results.", "success");
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function runInstallation(logEl, btn) {
+  const f = state.installationForm;
+  if (f.authMethod === "password" && !f.sshPassword) {
+    showToast("Enter a password, or switch to Public key auth.", "error");
+    return;
+  }
+  if (!confirm(
+    `Really run a real cluster install (ansible-playbook cluster.yml) against inventory "${state.inventory}"? ` +
+    `This installs Kubernetes components on every host in that inventory - there's no undo short of running reset.yml.`
+  )) return;
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.installationLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/installation/run`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true,
+        ssh_user: f.sshUser || null,
+        auth_method: f.authMethod,
+        ssh_password: f.authMethod === "password" ? f.sshPassword : null,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.installationLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const freshData = await api(`/api/inventories/${state.inventory}/installation/plan`);
+    showToast("Installation finished - check the log for the play recap.", "success");
+    renderInstallation(freshData);
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function renderInstallation(data) {
+  const wrap = document.createElement("div");
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2>Installation</h2><span class="path">inventory/${state.inventory}</span>`;
+  wrap.appendChild(header);
+
+  const desc = document.createElement("div");
+  desc.className = "file-desc";
+  desc.textContent = "Runs the real kubespray cluster install (ansible-playbook cluster.yml) against this inventory's hosts.";
+  wrap.appendChild(desc);
+
+  const dangerBanner = document.createElement("div");
+  dangerBanner.className = "ops-note danger";
+  dangerBanner.textContent = "This installs real Kubernetes components (containerd, kubelet, etcd, control plane, etc.) on every host in this inventory. There is no undo short of running reset.yml against the same hosts.";
+  wrap.appendChild(dangerBanner);
+
+  const form = document.createElement("div");
+  form.className = "ops-fields";
+
+  const userInput = document.createElement("input");
+  userInput.type = "text";
+  userInput.placeholder = "(defaults to inventory's ansible_user)";
+  userInput.value = state.installationForm.sshUser;
+
+  const keyRadio = document.createElement("input");
+  keyRadio.type = "radio";
+  keyRadio.name = "installationAuthMethod";
+  keyRadio.checked = state.installationForm.authMethod === "publickey";
+  const passRadio = document.createElement("input");
+  passRadio.type = "radio";
+  passRadio.name = "installationAuthMethod";
+  passRadio.checked = state.installationForm.authMethod === "password";
+
+  const passwordInput = document.createElement("input");
+  passwordInput.type = "password";
+  passwordInput.placeholder = "SSH + sudo password";
+  passwordInput.value = state.installationForm.sshPassword;
+  passwordInput.disabled = state.installationForm.authMethod !== "password";
+
+  const cmdBox = document.createElement("pre");
+  cmdBox.className = "raw-editor ops-cmd-output";
+  cmdBox.textContent = buildInstallationCommand(data.command);
+  cmdBox.style.marginBottom = "10px";
+
+  const refreshCmd = () => { cmdBox.textContent = buildInstallationCommand(data.command); };
+  userInput.addEventListener("input", () => { state.installationForm.sshUser = userInput.value; refreshCmd(); });
+  keyRadio.addEventListener("change", () => {
+    state.installationForm.authMethod = "publickey";
+    passwordInput.disabled = true;
+    refreshCmd();
+  });
+  passRadio.addEventListener("change", () => {
+    state.installationForm.authMethod = "password";
+    passwordInput.disabled = false;
+    refreshCmd();
+  });
+  passwordInput.addEventListener("input", () => { state.installationForm.sshPassword = passwordInput.value; refreshCmd(); });
+
+  form.appendChild(opsField("SSH user (-u)", userInput));
+  form.appendChild(opsField("Public key (uses this host's mounted SSH keys)", keyRadio));
+  form.appendChild(opsField("Password", passRadio));
+  form.appendChild(opsField("Password value", passwordInput));
+  wrap.appendChild(form);
+
+  const checkRow = document.createElement("div");
+  const checkBtn = document.createElement("button");
+  checkBtn.className = "btn-secondary";
+  checkBtn.textContent = "🔌 Check connectivity";
+  checkBtn.title = "Read-only - runs ansible -m ping against every host in this inventory using the fields above. Doesn't touch cluster.yml or any host state.";
+
+  if (data.connectivity_running) {
+    checkBtn.disabled = true;
+    checkBtn.textContent = "Checking… (started elsewhere)";
+  }
+
+  const checkLogEl = document.createElement("pre");
+  checkLogEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorCheckLog = data.connectivity_log || state.connectivityLog;
+  state.connectivityLog = priorCheckLog || "";
+  checkLogEl.textContent = priorCheckLog || "";
+  checkLogEl.style.display = priorCheckLog ? "block" : "none";
+  checkLogEl.style.marginTop = "10px";
+  checkLogEl.style.marginBottom = "10px";
+
+  checkBtn.addEventListener("click", () => runConnectivityCheck(checkLogEl, checkBtn));
+
+  checkRow.appendChild(checkBtn);
+  wrap.appendChild(checkRow);
+  wrap.appendChild(checkLogEl);
+
+  wrap.appendChild(cmdBox);
+
+  const runRow = document.createElement("div");
+  const runBtn = document.createElement("button");
+  runBtn.className = "btn-danger";
+  runBtn.textContent = "▶ Run cluster install";
+
+  if (data.running) {
+    runBtn.disabled = true;
+    runBtn.textContent = "Running… (started elsewhere)";
+    runBtn.title = "An install run for this inventory is already in progress, possibly from before this page load - this will update on its own once it finishes.";
+  }
+
+  const logEl = document.createElement("pre");
+  logEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorLog = data.log || state.installationLog;
+  state.installationLog = priorLog || "";
+  logEl.textContent = priorLog || "";
+  logEl.style.display = priorLog ? "block" : "none";
+  logEl.style.marginTop = "10px";
+
+  runBtn.addEventListener("click", () => runInstallation(logEl, runBtn));
+
+  runRow.appendChild(runBtn);
+  wrap.appendChild(runRow);
+  wrap.appendChild(logEl);
+
+  content.innerHTML = "";
+  content.appendChild(wrap);
+
+  if (data.running || data.connectivity_running) {
+    setTimeout(() => pollInstallationRunning({
+      running: data.running, log: data.log,
+      connectivity_running: data.connectivity_running, connectivity_log: data.connectivity_log,
+    }), 4000);
+  }
 }
 
 function renderVarRow(entry) {

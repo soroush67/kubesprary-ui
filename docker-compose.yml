@@ -6,6 +6,9 @@ services:
     volumes:
       - ../kubespray:/kubespray
       - /var/run/docker.sock:/var/run/docker.sock
+      # Publickey auth for the Installation tab's real cluster.yml runs -
+      # same SSH_DIR the backup-sync service already uses below.
+      - ${SSH_DIR:-/home/soroush/.ssh}:/root/.ssh:ro
     environment:
       - KUBESPRAY_ROOT=/kubespray
       # Real host-side path to the kubespray checkout. Needed because `docker run -v`
