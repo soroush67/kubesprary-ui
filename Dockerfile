@@ -39,6 +39,7 @@ RUN pip install --no-cache-dir -r backend/requirements.txt \
 COPY backend ./backend
 COPY static ./static
 COPY molecule ./molecule
+COPY playbooks ./playbooks
 
 WORKDIR /app/backend
 ENV KUBESPRAY_ROOT=/kubespray

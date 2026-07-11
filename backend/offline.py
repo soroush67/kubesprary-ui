@@ -145,7 +145,12 @@ def download_files_command(kubespray_root: Path) -> str:
     return (
         f"echo 'inet4only = on' > ~/.wgetrc && "
         f"mkdir -p {files_dir} && "
-        f"while read -r url; do [ -n \"$url\" ] && wget -c -x -P {files_dir} \"$url\"; done "
+        # -nv (no-verbose) instead of wget's default: default prints a
+        # progress-dot block per ~50KB chunk (unreadable spam once streamed
+        # to the browser - a single file can produce hundreds of lines);
+        # -nv prints exactly one summary line per file instead (URL, size,
+        # saved-as path), still showing real progress/errors per file.
+        f"while read -r url; do [ -n \"$url\" ] && wget -nv -c -x -P {files_dir} \"$url\"; done "
         f"< {offline_dir}/temp/files.list && "
         f"tar -czf {offline_dir}/offline-files.tar.gz -C {offline_dir} offline-files"
     )
@@ -192,11 +197,31 @@ def offline_yml_updates(host_address: str) -> dict:
     # The 4 values kubespray's offline.yml needs to point the REAL target k8s nodes
     # (separate machines) at these repos. Deliberately NOT localhost - that's only
     # correct for the push step above, which runs locally via the Docker socket.
+    #
+    # registry_host alone does NOT redirect container image pulls - confirmed by
+    # hitting this directly on a real cluster.yml run: with only registry_host set,
+    # cluster.yml still pulled every image straight from quay.io/docker.io/etc.,
+    # ignoring the local mirror entirely, and failed once one of those direct pulls
+    # got rate-limited. kubespray's own docs (docs/operations/offline-environment.md)
+    # spell out why: `kube_image_repo`/`gcr_image_repo`/`docker_image_repo`/
+    # `quay_image_repo`/`github_image_repo` are separate variables that actually
+    # rewrite each image reference's registry prefix - registry_host is just what
+    # they commonly template against, not a substitute for setting them. All 5 are
+    # already present as commented-out placeholders in kubespray's own
+    # inventory/sample/group_vars/all/offline.yml (`# kube_image_repo: "{{
+    # registry_host }}"` etc.) - this just enables them at their existing templated
+    # value, so they always follow whatever registry_host is set to.
+    image_repo_template = '"{{ registry_host }}"'
     return {
         "registry_host": {"enabled": True, "value": f'"{host_address}:{LOCAL_REGISTRY_PORT}"'},
         "files_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_NGINX_PORT}"'},
         "ubuntu_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_APT_PORT}"'},
         "debian_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_APT_PORT}"'},
+        "kube_image_repo": {"enabled": True, "value": image_repo_template},
+        "gcr_image_repo": {"enabled": True, "value": image_repo_template},
+        "github_image_repo": {"enabled": True, "value": image_repo_template},
+        "docker_image_repo": {"enabled": True, "value": image_repo_template},
+        "quay_image_repo": {"enabled": True, "value": image_repo_template},
     }
 
 

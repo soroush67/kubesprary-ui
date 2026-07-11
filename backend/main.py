@@ -30,6 +30,7 @@ INVENTORY_ROOT = KUBESPRAY_ROOT / "inventory"
 SAMPLE_DIR = INVENTORY_ROOT / "sample"
 STATIC_DIR = (BASE_DIR / ".." / "static").resolve()
 MOLECULE_ROOT = (BASE_DIR / ".." / "molecule").resolve()
+VERIFY_CLUSTER_PLAYBOOK = (BASE_DIR / ".." / "playbooks" / "verify-cluster.yml").resolve()
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,200}$")
@@ -460,8 +461,21 @@ async def _stream_shell(cmd: str, cwd: Path, lock: asyncio.Lock, key: str, logs:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
-        async for raw_line in proc.stdout:
-            text = raw_line.decode(errors="replace")
+        # Read fixed-size chunks, not lines: asyncio's line-based iteration
+        # (`async for line in proc.stdout`) buffers up to one line at a time
+        # with a ~64KB cap, and raises ValueError("Separator is found, but
+        # chunk is longer than limit") if a single line exceeds it - hit this
+        # for real with cluster.yml's "Docker | Get package facts" task,
+        # which emits one enormous single-line JSON blob per host. That
+        # exception propagated out of the StreamingResponse body iterator,
+        # killing the whole HTTP connection mid-stream (surfaced to the
+        # browser as a bare network error, with no indication of why).
+        # Chunked reads have no such per-line limit.
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                break
+            text = chunk.decode(errors="replace")
             logs[key] = (logs[key] + text)[-LOG_CAP:]
             yield text
         await proc.wait()
@@ -620,15 +634,33 @@ def _connectivity_lock(inv: str) -> asyncio.Lock:
     return CONNECTIVITY_LOCKS[inv]
 
 
+# "Verify cluster" - checks a real, already-installed cluster is actually
+# healthy (every node Ready, every pod Running/Succeeded), not just that
+# cluster.yml exited 0. Read-only against the cluster itself (kubectl get,
+# no mutations) - own lock/log dict, same per-inventory dynamic shape as
+# the two above.
+VERIFY_LOCKS: dict[str, asyncio.Lock] = {}
+VERIFY_LOGS: dict[str, str] = {}
+
+
+def _verify_lock(inv: str) -> asyncio.Lock:
+    if inv not in VERIFY_LOCKS:
+        VERIFY_LOCKS[inv] = asyncio.Lock()
+        VERIFY_LOGS[inv] = ""
+    return VERIFY_LOCKS[inv]
+
+
 @app.get("/api/inventories/{inv}/installation/plan")
 def installation_plan(inv: str):
     inv_dir = _inventory_dir(inv)
     lock = _installation_lock(inv)
     conn_lock = _connectivity_lock(inv)
+    verify_lock = _verify_lock(inv)
     command = f"ansible-playbook -i inventory/{inv}/{off.inventory_file(inv_dir)} cluster.yml -b -v"
     return {
         "command": command, "running": lock.locked(), "log": INSTALLATION_LOGS[inv],
         "connectivity_running": conn_lock.locked(), "connectivity_log": CONNECTIVITY_LOGS[inv],
+        "verify_running": verify_lock.locked(), "verify_log": VERIFY_LOGS[inv],
     }
 
 
@@ -662,6 +694,20 @@ def run_installation(inv: str, payload: InstallPayload):
     command += _auth_flags(payload)
     return StreamingResponse(
         _stream_shell(command, KUBESPRAY_ROOT, lock, inv, INSTALLATION_LOGS),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/installation/verify")
+def verify_installation(inv: str, payload: InstallPayload):
+    inv_dir = _inventory_dir(inv)
+    _validate_auth(payload)
+    _verify_lock(inv)
+    lock = _check_not_running(inv, VERIFY_LOCKS)
+    command = f"ansible-playbook -i inventory/{inv}/{off.inventory_file(inv_dir)} {VERIFY_CLUSTER_PLAYBOOK} -b -v"
+    command += _auth_flags(payload)
+    return StreamingResponse(
+        _stream_shell(command, KUBESPRAY_ROOT, lock, inv, VERIFY_LOGS),
         media_type="text/plain",
     )
 

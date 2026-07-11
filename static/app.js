@@ -46,6 +46,36 @@ function showToast(msg, kind) {
   setTimeout(() => { toast.className = "toast hidden"; }, 3500);
 }
 
+// _stream_shell (backend/main.py) always appends "\n[exit code N]\n" as the
+// last thing it streams - this is the only reliable signal of whether a
+// streamed run actually succeeded. The stream ending without an HTTP error
+// does NOT mean the underlying command succeeded (e.g. `create && register`
+// where create() fails: the shell exits non-zero, but the whole response
+// still streams and completes normally) - every run-completion handler must
+// check this, not just assume success once the reader is done.
+function parseExitCode(log) {
+  const m = log.match(/\[exit code (-?\d+)\]\s*$/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Polling redraws (renderX(freshData)) tear down and recreate the whole tab's
+// DOM, including any log <pre> the user might have scrolled up in to read
+// past output - recreating the element resets scrollTop to 0, which reads as
+// the view "jumping back up" every ~4s while a run is in progress. Snapshot
+// scrollTop by element id before the redraw and restore it after.
+function preserveScroll(ids, redrawFn) {
+  const positions = {};
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el) positions[id] = el.scrollTop;
+  }
+  redrawFn();
+  for (const id of ids) {
+    const el = document.getElementById(id);
+    if (el && positions[id] !== undefined) el.scrollTop = positions[id];
+  }
+}
+
 async function api(path, opts) {
   const res = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
@@ -982,7 +1012,12 @@ async function runOfflineStage(stageId, body, logEl, btn) {
     // restores this log instead of wiping it.
     const freshData = await api(`/api/inventories/${state.inventory}/offline/plan`);
     const line = offlineStatusLine(freshData, stageId);
-    showToast(line ? `Done - ${line}` : "Done.", "success");
+    const code = parseExitCode(state.offlineLogs[stageId]);
+    if (code === 0) {
+      showToast(line ? `Done - ${line}` : "Done.", "success");
+    } else {
+      showToast(`${stageId} failed (exit code ${code}) - check the log.`, "error");
+    }
     renderOffline(freshData);
   } catch (e) {
     showToast("Error: " + e.message, "error");
@@ -1402,7 +1437,12 @@ async function runMoleculeRole(role, logEl, btn) {
       logEl.scrollTop = logEl.scrollHeight;
     }
     const freshData = await api("/api/molecule/plan");
-    showToast(`${role}: done.`, "success");
+    const code = parseExitCode(state.moleculeLogs[role]);
+    if (code === 0) {
+      showToast(`${role}: passed.`, "success");
+    } else {
+      showToast(`${role}: failed (exit code ${code}) - check the log.`, "error");
+    }
     renderMolecule(freshData);
   } catch (e) {
     showToast("Error: " + e.message, "error");
@@ -1495,6 +1535,9 @@ if (!state.installationLog) {
 if (!state.connectivityLog) {
   state.connectivityLog = "";
 }
+if (!state.verifyLog) {
+  state.verifyLog = "";
+}
 if (!state.installationForm) {
   // authMethod "publickey" relies on the webui container's own mounted SSH_DIR
   // (same key(s) the backup-sync service already uses) reaching these hosts -
@@ -1535,11 +1578,15 @@ async function pollInstallationRunning(previousSnapshot) {
     const snapshot = {
       running: freshData.running, log: freshData.log,
       connectivity_running: freshData.connectivity_running, connectivity_log: freshData.connectivity_log,
+      verify_running: freshData.verify_running, verify_log: freshData.verify_log,
     };
     const changed = JSON.stringify(snapshot) !== JSON.stringify(previousSnapshot);
     if (changed) {
-      renderInstallation(freshData);
-    } else if (freshData.running || freshData.connectivity_running) {
+      preserveScroll(
+        ["installationConnectivityLog", "installationInstallLog", "installationVerifyLog"],
+        () => renderInstallation(freshData)
+      );
+    } else if (freshData.running || freshData.connectivity_running || freshData.verify_running) {
       setTimeout(() => pollInstallationRunning(snapshot), 4000);
     }
   } catch (e) {
@@ -1583,7 +1630,58 @@ async function runConnectivityCheck(logEl, btn) {
       state.connectivityLog += chunk;
       logEl.scrollTop = logEl.scrollHeight;
     }
-    showToast("Connectivity check finished - see the log for per-host results.", "success");
+    const connCode = parseExitCode(state.connectivityLog);
+    if (connCode === 0) {
+      showToast("Connectivity check passed - all hosts reachable.", "success");
+    } else {
+      showToast(`Connectivity check found problems (exit code ${connCode}) - see the log.`, "error");
+    }
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function runVerifyCluster(logEl, btn) {
+  const f = state.installationForm;
+  if (f.authMethod === "password" && !f.sshPassword) {
+    showToast("Enter a password, or switch to Public key auth.", "error");
+    return;
+  }
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Verifying…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.verifyLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/installation/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ssh_user: f.sshUser || null,
+        auth_method: f.authMethod,
+        ssh_password: f.authMethod === "password" ? f.sshPassword : null,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.verifyLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const passed = state.verifyLog.includes("CLUSTER VERIFICATION PASSED");
+    showToast(passed ? "Cluster verification passed." : "Cluster verification found problems - see the log.", passed ? "success" : "error");
   } catch (e) {
     showToast("Error: " + e.message, "error");
   } finally {
@@ -1634,7 +1732,12 @@ async function runInstallation(logEl, btn) {
       logEl.scrollTop = logEl.scrollHeight;
     }
     const freshData = await api(`/api/inventories/${state.inventory}/installation/plan`);
-    showToast("Installation finished - check the log for the play recap.", "success");
+    const installCode = parseExitCode(state.installationLog);
+    if (installCode === 0) {
+      showToast("Installation finished successfully - check the log for the play recap.", "success");
+    } else {
+      showToast(`Installation failed (exit code ${installCode}) - check the log.`, "error");
+    }
     renderInstallation(freshData);
   } catch (e) {
     showToast("Error: " + e.message, "error");
@@ -1721,6 +1824,7 @@ function renderInstallation(data) {
   }
 
   const checkLogEl = document.createElement("pre");
+  checkLogEl.id = "installationConnectivityLog";
   checkLogEl.className = "raw-editor ops-cmd-output offline-log";
   const priorCheckLog = data.connectivity_log || state.connectivityLog;
   state.connectivityLog = priorCheckLog || "";
@@ -1749,6 +1853,7 @@ function renderInstallation(data) {
   }
 
   const logEl = document.createElement("pre");
+  logEl.id = "installationInstallLog";
   logEl.className = "raw-editor ops-cmd-output offline-log";
   const priorLog = data.log || state.installationLog;
   state.installationLog = priorLog || "";
@@ -1762,13 +1867,46 @@ function renderInstallation(data) {
   wrap.appendChild(runRow);
   wrap.appendChild(logEl);
 
+  const verifyDesc = document.createElement("div");
+  verifyDesc.className = "file-desc";
+  verifyDesc.textContent = "After install: checks the real cluster (not just that cluster.yml exited 0) - every node Ready, every pod Running/Succeeded, via kubectl on the first control-plane host.";
+  verifyDesc.style.marginTop = "16px";
+  wrap.appendChild(verifyDesc);
+
+  const verifyRow = document.createElement("div");
+  const verifyBtn = document.createElement("button");
+  verifyBtn.className = "btn-secondary";
+  verifyBtn.textContent = "✅ Verify cluster";
+  verifyBtn.title = "Read-only - runs kubectl get nodes/pods over SSH using the fields above. Doesn't change anything.";
+
+  if (data.verify_running) {
+    verifyBtn.disabled = true;
+    verifyBtn.textContent = "Verifying… (started elsewhere)";
+  }
+
+  const verifyLogEl = document.createElement("pre");
+  verifyLogEl.id = "installationVerifyLog";
+  verifyLogEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorVerifyLog = data.verify_log || state.verifyLog;
+  state.verifyLog = priorVerifyLog || "";
+  verifyLogEl.textContent = priorVerifyLog || "";
+  verifyLogEl.style.display = priorVerifyLog ? "block" : "none";
+  verifyLogEl.style.marginTop = "10px";
+
+  verifyBtn.addEventListener("click", () => runVerifyCluster(verifyLogEl, verifyBtn));
+
+  verifyRow.appendChild(verifyBtn);
+  wrap.appendChild(verifyRow);
+  wrap.appendChild(verifyLogEl);
+
   content.innerHTML = "";
   content.appendChild(wrap);
 
-  if (data.running || data.connectivity_running) {
+  if (data.running || data.connectivity_running || data.verify_running) {
     setTimeout(() => pollInstallationRunning({
       running: data.running, log: data.log,
       connectivity_running: data.connectivity_running, connectivity_log: data.connectivity_log,
+      verify_running: data.verify_running, verify_log: data.verify_log,
     }), 4000);
   }
 }

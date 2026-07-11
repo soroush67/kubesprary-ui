@@ -354,6 +354,33 @@ both found by hitting them in practice:
    register (create() will resume near-instantly from Docker's own layer
    cache) and manual re-registration of just the missing ones is also an
    option if this recurs.
+8. **`registry.k8s.io/pause:3.10.1` fails to pull with `403 Forbidden`**
+   (`"unexpected status from HEAD request to https://registry.k8s.io/v2/
+   pause/manifests/3.10.1: 403 Forbidden"`), consistently, after all
+   retries - a real `registry.k8s.io`-side rejection (likely rate-
+   limiting/access restriction on that registry, not something this tool
+   controls), not a webui bug. Every *other* image in a real `afshin` run
+   pulled fine. **Known limitation, not fixed**: if this recurs, the whole
+   `create()` step exits non-zero and `register()` never runs (same `&&`-
+   chaining as gotcha #7) - no current workaround from inside this tool;
+   would need either retrying later, pulling that one image through a
+   different path/mirror, or investigating why `registry.k8s.io` is
+   rejecting this host's requests.
+9. **(Real bug, now fixed) The frontend showed a "success" toast
+   unconditionally, regardless of the command's actual exit code.**
+   `runOfflineStage()` (and the equivalent completion handlers for
+   Molecule/Installation/Check Connectivity) just showed "Done"/"success"
+   once the HTTP stream ended normally - but the stream ending normally
+   only means the *HTTP response* completed, not that the underlying shell
+   command exited 0. This is exactly gotcha #8 above: `create() &&
+   register()` with `create()` failing (exit code 1) still streams a
+   complete, well-formed response - so the UI said "Done" while the real
+   log ended in `[exit code 1]` and no images were ever registered. Fixed
+   by adding `parseExitCode()` (parses the `[exit code N]` marker
+   `_stream_shell` already appends to every log) and using it in every
+   run-completion handler to show an accurate success/error toast instead
+   of assuming success. Found directly from the user noticing the
+   mismatch: images failed to pull, but the tab reported success anyway.
 
 ### Verification status — all 5 stages confirmed working end-to-end (2026-07-10)
 
@@ -610,6 +637,27 @@ the check that found the `afshin` inventory's `worker3` had a different
 means that kind of check no longer needs a manual `docker exec ... ansible
 -m ping` from the terminal.
 
+**Verify cluster button**: checks a real, already-installed cluster is
+*actually* healthy - not just that `cluster.yml` exited 0. New playbook
+`playbooks/verify-cluster.yml` (in kubespray-webui, not the kubespray
+checkout - same reasoning as `molecule/`), targets `kube_control_plane[0]`,
+runs `kubectl --kubeconfig=/etc/kubernetes/admin.conf get nodes -o json` /
+`get pods -A -o json`, then uses real Ansible `assert` tasks (not custom
+Python parsing) to check every node's `Ready` condition and every pod's
+phase is `Running`/`Succeeded` - each assert is `ignore_errors: true` +
+`register`'d so ALL nodes/pods get checked and reported even if one fails
+partway, then one final `assert` combines both into a single clear
+PLAY RECAP-visible PASS/FAIL (`"CLUSTER VERIFICATION PASSED/FAILED"` -
+`app.js`'s `runVerifyCluster()` greps the streamed log for the PASSED
+string to color the toast). Own lock/log dict (`VERIFY_LOCKS`/
+`VERIFY_LOGS`), reuses the same `-u`/auth-method fields and `_auth_flags()`/
+`_validate_auth()` helpers as install/connectivity - no `confirm` gate
+needed since it's read-only against the cluster (no mutations, just
+`kubectl get`). Verified for real against `afshin` (no cluster installed
+yet there) - connected via SSH correctly, failed cleanly with `kubectl:
+No such file or directory` since `cluster.yml` hasn't been run yet; will
+give a real, accurate report once a cluster actually exists.
+
 **Why `local` was deliberately avoided for real-run testing**: `local` is
 `ansible_connection=local` (single all-in-one node) - the target host **is
 this machine**, so a real run would install actual Kubernetes components
@@ -666,6 +714,45 @@ system.
    hadn't been hit yet in this process's lifetime (hit this directly after
    a container restart wiped the in-memory dicts). Fixed by also calling
    `_installation_lock(inv)` at the top of `run_installation()`.
+5. **(Process gotcha, not code) Rebuilding/recreating the `webui` container
+   silently kills any real run in progress.** `docker-compose build webui &&
+   docker-compose up -d webui` (needed after every backend/frontend edit -
+   see "Git state" above) kills every process inside the old container,
+   including a real, in-flight `ansible-playbook cluster.yml` - and wipes
+   `INSTALLATION_LOGS`/etc. (in-memory, gone with the process), so the user
+   sees the run just silently stop with no error and an empty log. This
+   happened for real once: a live `afshin` install got killed mid-`docker`
+   role (~48s in) by a container rebuild done to ship the Verify Cluster
+   feature. Confirmed via direct SSH check afterward that nothing had
+   actually changed on any of the 6 hosts yet (still stock Ubuntu
+   `containerd`, no Docker CE apt repo added) - the task it died on
+   (`Docker | Get package facts`) is read-only, so this particular
+   interruption happened to be harmless, but that was luck, not something
+   to rely on. **Rule going forward**: before any `docker-compose build
+   webui`/`up -d webui`, check `GET /api/inventories/{inv}/installation/plan`
+   (`running`) for every inventory that might have a real install going -
+   don't rebuild while one's in flight. **This happened a second time**
+   shortly after: a rebuild done right after confirming an unrelated
+   `download-files` run had finished coincided with the user starting a
+   real install in that same window - killed again, same symptoms (empty
+   log, browser-side "network error" from the stream disconnecting
+   mid-request). Checking *one* real-run type isn't enough - check
+   Offline Install, Ansible Molecule, *and* Installation's running-state
+   (all of them, across all inventories) before every rebuild, not just
+   the one the user most recently mentioned.
+6. **Polling redraws reset the log panel's scroll position every ~4s.**
+   `pollInstallationRunning()` (and the equivalent Offline/Molecule poll
+   functions) call `renderInstallation(freshData)` on any change, which
+   tears down and recreates the whole tab's DOM - including the log
+   `<pre>` elements - resetting `scrollTop` to 0 even if the user had
+   scrolled up to read earlier output. Reported directly by the user
+   ("wenever I scroll down, it jumps back up by itself") while a real
+   install was streaming live. Fixed with `preserveScroll()` (`app.js`):
+   snapshots `scrollTop` by element id (`installationConnectivityLog`/
+   `installationInstallLog`/`installationVerifyLog`) before the redraw,
+   restores it after. Same underlying issue likely affects the Offline
+   Install/Molecule tabs' own poll-triggered redraws too - not yet fixed
+   there, only reported for Installation so far.
 
 ### Verification status (2026-07-11)
 

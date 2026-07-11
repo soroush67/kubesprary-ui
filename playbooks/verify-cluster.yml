@@ -1,0 +1,60 @@
+---
+# Verifies a kubespray-installed cluster is actually healthy - not just that
+# cluster.yml exited 0. Lives here (kubespray-webui), not inside the
+# kubespray checkout, for the same reason as molecule/: the checkout can be
+# re-cloned/switched/wiped independently (see the "Kubespray Version" tab).
+# Runs kubectl against the real cluster via the first control-plane host's
+# own admin kubeconfig - no roles/collections beyond what's already needed
+# for cluster.yml itself.
+- name: Verify cluster is healthy
+  hosts: kube_control_plane[0]
+  gather_facts: false
+  become: true
+  vars:
+    kubeconfig: /etc/kubernetes/admin.conf
+
+  tasks:
+    - name: Get node status
+      ansible.builtin.command: "kubectl --kubeconfig={{ kubeconfig }} get nodes -o json"
+      register: nodes_raw
+      changed_when: false
+
+    - name: Get pod status across all namespaces
+      ansible.builtin.command: "kubectl --kubeconfig={{ kubeconfig }} get pods -A -o json"
+      register: pods_raw
+      changed_when: false
+
+    - name: Parse node/pod status
+      ansible.builtin.set_fact:
+        verify_nodes: "{{ (nodes_raw.stdout | from_json)['items'] }}"
+        verify_pods: "{{ (pods_raw.stdout | from_json)['items'] }}"
+
+    - name: Assert every node is Ready
+      ansible.builtin.assert:
+        that: (item.status.conditions | selectattr('type', 'equalto', 'Ready') | first).status == "True"
+        fail_msg: "Node {{ item.metadata.name }} is NOT Ready"
+        success_msg: "Node {{ item.metadata.name }} is Ready"
+      loop: "{{ verify_nodes }}"
+      loop_control:
+        label: "{{ item.metadata.name }}"
+      register: nodes_check
+      ignore_errors: true
+
+    - name: Assert every pod is Running or Succeeded
+      ansible.builtin.assert:
+        that: item.status.phase in ["Running", "Succeeded"]
+        fail_msg: "Pod {{ item.metadata.namespace }}/{{ item.metadata.name }} is in phase {{ item.status.phase }}"
+        success_msg: "Pod {{ item.metadata.namespace }}/{{ item.metadata.name }} is {{ item.status.phase }}"
+      loop: "{{ verify_pods }}"
+      loop_control:
+        label: "{{ item.metadata.namespace }}/{{ item.metadata.name }}"
+      register: pods_check
+      ignore_errors: true
+
+    - name: Overall verification result
+      ansible.builtin.assert:
+        that:
+          - nodes_check is succeeded
+          - pods_check is succeeded
+        fail_msg: "CLUSTER VERIFICATION FAILED - {{ verify_nodes | length }} node(s), {{ verify_pods | length }} pod(s) checked, see failed items above."
+        success_msg: "CLUSTER VERIFICATION PASSED - all {{ verify_nodes | length }} node(s) Ready, all {{ verify_pods | length }} pod(s) healthy."
