@@ -1,0 +1,12 @@
+---
+# Copied verbatim from kubespray's roles/adduser/molecule/default/converge.yml
+# (upstream, KubeVirt-based scenario) - only molecule.yml differs here.
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - role: adduser
+  vars:
+    user:
+      name: foo

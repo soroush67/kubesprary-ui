@@ -19,12 +19,6 @@
         <button id="newInvBtn" class="btn-secondary" title="Create a new cluster inventory">+ New</button>
         <button id="deleteInvBtn" class="btn-danger" title="Delete this inventory">Delete</button>
       </div>
-      <div class="view-tabs">
-        <button id="filesTabBtn" class="tab-btn active">Files</button>
-        <button id="opsTabBtn" class="tab-btn">Cluster Operations</button>
-        <button id="kubesprayTabBtn" class="tab-btn">Kubespray Version</button>
-        <button id="offlineTabBtn" class="tab-btn">Offline Install</button>
-      </div>
       <div class="search-controls">
         <input id="searchInput" type="search" placeholder="Search variables everywhere…" />
         <div id="searchResults" class="search-results hidden"></div>
@@ -32,6 +26,14 @@
     </header>
 
     <div class="body">
+      <nav id="primaryNav" class="primary-nav">
+        <button id="filesTabBtn" class="nav-btn active">Files</button>
+        <button id="opsTabBtn" class="nav-btn">Cluster Operations</button>
+        <button id="kubesprayTabBtn" class="nav-btn">Kubespray Version</button>
+        <button id="offlineTabBtn" class="nav-btn">Offline Install</button>
+        <button id="moleculeTabBtn" class="nav-btn">Ansible Molecule</button>
+        <button id="installationTabBtn" class="nav-btn">Installation</button>
+      </nav>
       <nav id="sidebar" class="sidebar"></nav>
 
       <main id="content" class="content">

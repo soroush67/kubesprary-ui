@@ -12,10 +12,15 @@ RUN apt-get update \
 WORKDIR /app
 
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt ansible-core
+RUN pip install --no-cache-dir -r backend/requirements.txt ansible-core molecule "molecule-plugins[docker]" \
+    # molecule-plugins[docker]'s driver is implemented as Ansible modules, not
+    # pure Python - ansible-core alone (deliberately lean, no community bundle -
+    # see offline.py's generate_list.sh gotcha) doesn't ship these collections.
+    && ansible-galaxy collection install community.docker ansible.posix
 
 COPY backend ./backend
 COPY static ./static
+COPY molecule ./molecule
 
 WORKDIR /app/backend
 ENV KUBESPRAY_ROOT=/kubespray

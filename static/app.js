@@ -60,6 +60,8 @@ const TOP_TABS = {
   ops: "opsTabBtn",
   kubespray: "kubesprayTabBtn",
   offline: "offlineTabBtn",
+  molecule: "moleculeTabBtn",
+  installation: "installationTabBtn",
 };
 
 async function init() {
@@ -71,6 +73,8 @@ async function init() {
   el("#opsTabBtn").addEventListener("click", () => switchTab("ops"));
   el("#kubesprayTabBtn").addEventListener("click", () => switchTab("kubespray"));
   el("#offlineTabBtn").addEventListener("click", () => switchTab("offline"));
+  el("#moleculeTabBtn").addEventListener("click", () => switchTab("molecule"));
+  el("#installationTabBtn").addEventListener("click", () => switchTab("installation"));
   searchInput.addEventListener("input", debounce(onSearch, 250));
   document.addEventListener("click", (e) => {
     if (!searchResults.contains(e.target) && e.target !== searchInput) {
@@ -102,6 +106,10 @@ async function switchTab(tab) {
     await loadKubespray();
   } else if (tab === "offline") {
     await loadOffline();
+  } else if (tab === "molecule") {
+    await loadMolecule();
+  } else if (tab === "installation") {
+    renderInstallationPlaceholder();
   } else {
     renderSidebar();
     if (state.currentPath === HOSTS_VIEW) {
@@ -1329,6 +1337,160 @@ function renderOffline(data) {
   if (Object.values(data.running).some(Boolean)) {
     setTimeout(() => pollOfflineRunning({ running: data.running, logs: data.logs }), 4000);
   }
+}
+
+// ---------- Ansible Molecule (real kubespray role tests) ----------
+// Structurally mirrors the Offline Install tab above (same server-side
+// lock/log/streaming mechanism in main.py, same "survive a refresh, only
+// redraw on real change" polling) - not inventory-scoped, since Molecule
+// tests a kubespray role in isolation, independent of any cluster config.
+// Separate from the Installation tab (real cluster install) - kept as its
+// own nav item per the user's explicit split.
+
+if (!state.moleculeLogs) {
+  state.moleculeLogs = {};
+}
+
+async function loadMolecule() {
+  content.innerHTML = `<div class="empty-state"><p>Checking status…</p></div>`;
+  try {
+    const data = await api("/api/molecule/plan");
+    renderMolecule(data);
+  } catch (e) {
+    content.innerHTML = "";
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+async function pollMoleculeRunning(previousSnapshot) {
+  if (state.topTab !== "molecule") return;
+  try {
+    const freshData = await api("/api/molecule/plan");
+    const snapshot = { running: freshData.running, logs: freshData.logs };
+    const changed = JSON.stringify(snapshot) !== JSON.stringify(previousSnapshot);
+    if (changed) {
+      renderMolecule(freshData);
+    } else if (Object.values(freshData.running).some(Boolean)) {
+      setTimeout(() => pollMoleculeRunning(snapshot), 4000);
+    }
+  } catch (e) {
+    // Transient - the next manual tab switch/reload will surface real errors.
+  }
+}
+
+async function runMoleculeRole(role, logEl, btn) {
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.moleculeLogs[role] = "";
+  try {
+    const res = await fetch(`/api/molecule/run/${role}`, { method: "POST" });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.moleculeLogs[role] += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const freshData = await api("/api/molecule/plan");
+    showToast(`${role}: done.`, "success");
+    renderMolecule(freshData);
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function renderMolecule(data) {
+  const wrap = document.createElement("div");
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2>Ansible Molecule</h2><span class="path">kubespray role tests</span>`;
+  wrap.appendChild(header);
+
+  const desc = document.createElement("div");
+  desc.className = "file-desc";
+  desc.textContent = "Runs real Molecule tests (create → converge → idempotence → destroy) against kubespray roles, using a plain Docker container - not kubespray's own KubeVirt-based CI scenarios, which need real cloud infrastructure this box doesn't have.";
+  wrap.appendChild(desc);
+
+  const dangerBanner = document.createElement("div");
+  dangerBanner.className = "ops-note danger";
+  dangerBanner.textContent = "Runs via this host's real Docker daemon (the same socket mount the Offline Install tab uses) - creates and destroys real test containers on this machine.";
+  wrap.appendChild(dangerBanner);
+
+  for (const role of data.roles) {
+    const card = document.createElement("div");
+    card.className = "host-card";
+
+    const cardHeader = document.createElement("div");
+    cardHeader.className = "file-header";
+    cardHeader.innerHTML = `<h2 style="font-size:15px">${role.title}</h2>` +
+      `<span class="path">${data.running[role.id] ? "running…" : ""}</span>`;
+    card.appendChild(cardHeader);
+
+    const note = document.createElement("div");
+    note.className = "ops-note";
+    note.textContent = role.description;
+    note.style.marginBottom = "10px";
+    card.appendChild(note);
+
+    const runRow = document.createElement("div");
+    runRow.style.marginTop = "10px";
+    const runBtn = document.createElement("button");
+    runBtn.className = "btn-primary";
+    runBtn.textContent = "▶ Run";
+
+    if (data.running[role.id]) {
+      runBtn.disabled = true;
+      runBtn.textContent = "Running… (started elsewhere)";
+      runBtn.title = "A run of this role is already in progress, possibly from before this page load - this will update on its own once it finishes.";
+    }
+
+    const logEl = document.createElement("pre");
+    logEl.className = "raw-editor ops-cmd-output offline-log";
+    const priorLog = (data.logs && data.logs[role.id]) || state.moleculeLogs[role.id];
+    state.moleculeLogs[role.id] = priorLog || "";
+    logEl.textContent = priorLog || "";
+    logEl.style.display = priorLog ? "block" : "none";
+    logEl.style.marginTop = "10px";
+
+    runBtn.addEventListener("click", () => runMoleculeRole(role.id, logEl, runBtn));
+
+    runRow.appendChild(runBtn);
+    card.appendChild(runRow);
+    card.appendChild(logEl);
+
+    wrap.appendChild(card);
+  }
+
+  content.innerHTML = "";
+  content.appendChild(wrap);
+
+  if (Object.values(data.running).some(Boolean)) {
+    setTimeout(() => pollMoleculeRunning({ running: data.running, logs: data.logs }), 4000);
+  }
+}
+
+// ---------- Installation (real cluster install - not yet defined) ----------
+// Separate from Ansible Molecule (role-level tests) per the user's explicit
+// split. Content TBD - don't invent what goes here until specified.
+function renderInstallationPlaceholder() {
+  content.innerHTML = `
+    <div class="empty-state">
+      <p>Installation</p>
+      <p class="path">Not configured yet.</p>
+    </div>`;
 }
 
 function renderVarRow(entry) {

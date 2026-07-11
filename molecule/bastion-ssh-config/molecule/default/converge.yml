@@ -1,0 +1,22 @@
+---
+# Copied verbatim from kubespray's roles/bastion-ssh-config/molecule/default/
+# converge.yml (upstream, KubeVirt-based scenario) - only molecule.yml
+# differs here. {{ playbook_dir }} below resolves to this directory (where
+# this file actually lives), which is exactly where the role's own
+# ssh-bastion.conf.j2 gets rendered to, by design (kept isolated from
+# kubespray's own molecule/default/ scenario - copied, not referenced, for
+# exactly this reason).
+- name: Converge
+  hosts: all
+  become: true
+  gather_facts: false
+  roles:
+    - role: bastion-ssh-config
+  tasks:
+    - name: Copy config to remote host
+      copy:
+        src: "{{ playbook_dir }}/{{ ssh_bastion_config_name }}"
+        dest: "{{ ssh_bastion_config_name }}"
+        owner: "{{ ansible_user }}"
+        group: "{{ ansible_user }}"
+        mode: "0644"

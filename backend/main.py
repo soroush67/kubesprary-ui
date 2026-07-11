@@ -14,6 +14,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import hosts_inventory as hv
+import molecule_runner as mol
 import offline as off
 import parser as gv
 
@@ -27,6 +28,7 @@ HOST_KUBESPRAY_ROOT = Path(os.environ["HOST_KUBESPRAY_ROOT"]).resolve() if os.en
 INVENTORY_ROOT = KUBESPRAY_ROOT / "inventory"
 SAMPLE_DIR = INVENTORY_ROOT / "sample"
 STATIC_DIR = (BASE_DIR / ".." / "static").resolve()
+MOLECULE_ROOT = (BASE_DIR / ".." / "molecule").resolve()
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,200}$")
@@ -437,14 +439,18 @@ OFFLINE_STAGE_LOCKS: dict[str, asyncio.Lock] = {
 # regardless (observed directly - killing the client doesn't kill the process).
 # So also mirror each stage's output here, capped, and hand it back from
 # /offline/plan - any page load can see "where things stand" even if it wasn't
-# the one that started the run.
+# the one that started the run. Shared (via the `locks`/`logs` params below)
+# with the Installation tab's Molecule runs - same mechanism, different keys.
 OFFLINE_STAGE_LOGS: dict[str, str] = {stage_id: "" for stage_id in OFFLINE_STAGE_LOCKS}
-OFFLINE_LOG_CAP = 20000
+LOG_CAP = 20000
+
+MOLECULE_LOCKS: dict[str, asyncio.Lock] = {role: asyncio.Lock() for role in mol.MOLECULE_ROLES}
+MOLECULE_LOGS: dict[str, str] = {role: "" for role in mol.MOLECULE_ROLES}
 
 
-async def _stream_shell(cmd: str, cwd: Path, lock: asyncio.Lock, stage_id: str):
+async def _stream_shell(cmd: str, cwd: Path, lock: asyncio.Lock, key: str, logs: dict[str, str]):
     await lock.acquire()
-    OFFLINE_STAGE_LOGS[stage_id] = ""
+    logs[key] = ""
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -454,39 +460,39 @@ async def _stream_shell(cmd: str, cwd: Path, lock: asyncio.Lock, stage_id: str):
         )
         async for raw_line in proc.stdout:
             text = raw_line.decode(errors="replace")
-            OFFLINE_STAGE_LOGS[stage_id] = (OFFLINE_STAGE_LOGS[stage_id] + text)[-OFFLINE_LOG_CAP:]
+            logs[key] = (logs[key] + text)[-LOG_CAP:]
             yield text
         await proc.wait()
         tail = f"\n[exit code {proc.returncode}]\n"
-        OFFLINE_STAGE_LOGS[stage_id] += tail
+        logs[key] += tail
         yield tail
     finally:
         lock.release()
 
 
-def _check_not_running(stage_id: str) -> asyncio.Lock:
-    lock = OFFLINE_STAGE_LOCKS[stage_id]
+def _check_not_running(key: str, locks: dict[str, asyncio.Lock]) -> asyncio.Lock:
+    lock = locks[key]
     if lock.locked():
-        raise HTTPException(409, f"A '{stage_id}' run is already in progress - wait for it to finish before starting another.")
+        raise HTTPException(409, f"A '{key}' run is already in progress - wait for it to finish before starting another.")
     return lock
 
 
 @app.post("/api/inventories/{inv}/offline/run/generate-lists")
 def run_generate_lists(inv: str):
     inv_dir = _inventory_dir(inv)
-    lock = _check_not_running("generate-lists")
+    lock = _check_not_running("generate-lists", OFFLINE_STAGE_LOCKS)
     stages = off.build_plan(KUBESPRAY_ROOT, HOST_KUBESPRAY_ROOT, inv, inv_dir, _current_ref(), off.detect_config(inv_dir), off.artifact_status(KUBESPRAY_ROOT))
     cmd = next(s["command"] for s in stages if s["id"] == "generate-lists")
-    return StreamingResponse(_stream_shell(cmd, KUBESPRAY_ROOT, lock, "generate-lists"), media_type="text/plain")
+    return StreamingResponse(_stream_shell(cmd, KUBESPRAY_ROOT, lock, "generate-lists", OFFLINE_STAGE_LOGS), media_type="text/plain")
 
 
 @app.post("/api/inventories/{inv}/offline/run/download-files")
 def run_download_files(inv: str):
     _inventory_dir(inv)
-    lock = _check_not_running("download-files")
+    lock = _check_not_running("download-files", OFFLINE_STAGE_LOCKS)
     cmd = off.download_files_command(KUBESPRAY_ROOT)
     return StreamingResponse(
-        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "download-files"),
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "download-files", OFFLINE_STAGE_LOGS),
         media_type="text/plain",
     )
 
@@ -499,10 +505,10 @@ def run_container_images(inv: str, payload: RegistryPayload):
     if payload.registry_mode == "remote":
         if not payload.registry_address or not REGISTRY_ADDR_RE.match(payload.registry_address):
             raise HTTPException(400, "Invalid registry address.")
-    lock = _check_not_running("container-images")
+    lock = _check_not_running("container-images", OFFLINE_STAGE_LOCKS)
     cmd = off.container_images_command(KUBESPRAY_ROOT, payload.registry_mode, payload.registry_address)
     return StreamingResponse(
-        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "container-images"),
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "container-images", OFFLINE_STAGE_LOGS),
         media_type="text/plain",
     )
 
@@ -512,10 +518,10 @@ def run_os_packages(inv: str, payload: OsPackagesPayload):
     inv_dir = _inventory_dir(inv)
     if not UBUNTU_RELEASE_RE.match(payload.ubuntu_release):
         raise HTTPException(400, "Invalid Ubuntu release, expected e.g. 24.04.")
-    lock = _check_not_running("os-packages")
+    lock = _check_not_running("os-packages", OFFLINE_STAGE_LOCKS)
     cmd = off.os_packages_command(KUBESPRAY_ROOT, HOST_KUBESPRAY_ROOT, payload.ubuntu_release, off.detect_config(inv_dir))
     return StreamingResponse(
-        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "os-packages"),
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "os-packages", OFFLINE_STAGE_LOGS),
         media_type="text/plain",
     )
 
@@ -523,10 +529,10 @@ def run_os_packages(inv: str, payload: OsPackagesPayload):
 @app.post("/api/inventories/{inv}/offline/run/pip-packages")
 def run_pip_packages(inv: str):
     _inventory_dir(inv)
-    lock = _check_not_running("pip-packages")
+    lock = _check_not_running("pip-packages", OFFLINE_STAGE_LOCKS)
     cmd = off.pip_packages_command(KUBESPRAY_ROOT)
     return StreamingResponse(
-        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "pip-packages"),
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "pip-packages", OFFLINE_STAGE_LOGS),
         media_type="text/plain",
     )
 
@@ -547,6 +553,32 @@ def configure_offline_yml(inv: str, payload: OfflineConfigurePayload):
     new_text = new_parsed.to_text()
     target.write_text(new_text)
     return {"path": "all/offline.yml", "raw": new_text}
+
+
+# --- Ansible Molecule tab: real Molecule role tests (Docker driver,
+# scenarios in ./molecule/, not inside the kubespray checkout - see
+# molecule_runner.py). Not inventory-scoped: Molecule tests a role in
+# isolation, independent of any specific cluster inventory. Separate from
+# the Installation tab (real cluster install) - kept as its own nav item
+# per the user's explicit split.
+
+@app.get("/api/molecule/plan")
+def molecule_plan():
+    running = {role: lock.locked() for role, lock in MOLECULE_LOCKS.items()}
+    roles = [{"id": role, **meta} for role, meta in mol.MOLECULE_ROLES.items()]
+    return {"roles": roles, "running": running, "logs": MOLECULE_LOGS}
+
+
+@app.post("/api/molecule/run/{role}")
+def run_molecule(role: str):
+    if role not in mol.MOLECULE_ROLES:
+        raise HTTPException(404, f"Unknown role '{role}'.")
+    lock = _check_not_running(role, MOLECULE_LOCKS)
+    cmd = mol.molecule_command(KUBESPRAY_ROOT, MOLECULE_ROOT, role)
+    return StreamingResponse(
+        _stream_shell(cmd, MOLECULE_ROOT / role, lock, role, MOLECULE_LOGS),
+        media_type="text/plain",
+    )
 
 
 app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")

@@ -1,0 +1,47 @@
+---
+# Docker-driver Molecule scenario for kubespray's "bastion-ssh-config" role.
+# Lives here (kubespray-webui), not inside the kubespray checkout - see
+# molecule/adduser/molecule.yml for why. ANSIBLE_ROLES_PATH is set by
+# backend/molecule_runner.py at invocation time, not here.
+driver:
+  name: docker
+platforms:
+  # bastion-ssh-config only templates a local file - no systemd/nested-docker
+  # needed. See molecule/adduser/molecule/default/molecule.yml for why
+  # command/privileged/cgroup were dropped (systemd doesn't boot reliably
+  # under this host's WSL2 kernel, and isn't needed for this role anyway).
+  - name: instance
+    image: "geerlingguy/docker-ubuntu2204-ansible:latest"
+    pre_build_image: true
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      callbacks_enabled: profile_tasks
+      timeout: 120
+  # The role's tasks/main.yml reads hostvars[groups['bastion'][0]] - upstream's
+  # own default scenario satisfies this by putting its single VM in a
+  # `bastion` group too (see roles/bastion-ssh-config/molecule/default/molecule.yml
+  # in the kubespray checkout); we do the same with our one "instance" host.
+  inventory:
+    hosts:
+      all:
+        children:
+          bastion:
+            hosts:
+              # ansible_host/ansible_port: the role only templates a config
+              # file here (delegate_to: localhost, no real SSH happens
+              # during converge) - real values don't matter, but *some*
+              # value has to exist since the role reads them directly.
+              # Molecule's docker driver doesn't set ansible_host itself
+              # (connectivity is via `docker exec`, not a real address).
+              instance:
+                ansible_host: instance
+                ansible_port: 22
+                # The role also reads ansible_user directly (real_user fact,
+                # used to build the ProxyCommand) - Molecule's docker driver
+                # execs as the image's default user (root here) but doesn't
+                # expose that as an inventory var itself, so it's set explicitly.
+                ansible_user: root
+verifier:
+  name: ansible

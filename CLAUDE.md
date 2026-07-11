@@ -12,7 +12,16 @@ memorizing ansible-playbook flags.
 - Pushed to `https://github.com/soroush67/kubesprary-ui.git`, branch `main`.
 - Host OS: Ubuntu 24.04.
 
-## Architecture — top nav has 4 tabs
+## Architecture — vertical left-hand nav, 6 destinations
+
+The left side of the page is a two-level layout: `#primaryNav` (5 nav
+buttons, `static/index.html`/`styles.css`'s `.primary-nav`/`.nav-btn`) is
+the outermost column, with the Files-only `#sidebar` (hosts/inventory list)
+as a second column that only shows when the Files tab is active — this
+replaced an earlier horizontal top-tab bar (`.view-tabs`/`.tab-btn`), moved
+to vertical per the user's request. `app.js`'s `TOP_TABS` maps each nav
+button id to its tab key; `switchTab()` still drives which tab is active,
+unchanged in shape from the old horizontal version.
 
 1. **Files** — sidebar with "Hosts & Inventory" + per-inventory `group_vars`
    files, parsed/edited via `backend/parser.py` (comment-preserving line
@@ -61,6 +70,18 @@ memorizing ansible-playbook flags.
    were several, each fixed by actually running the thing, not by
    inspection), and current verification state — all 5 stages are now
    verified working end-to-end.
+5. **Ansible Molecule** — real Molecule role tests, not a command builder.
+   Currently one card: **run Molecule against a kubespray role**
+   (`adduser`, `bastion-ssh-config`). See "Ansible Molecule tab — Molecule
+   role tests" below for full design/gotchas.
+6. **Installation** — placeholder, not built yet. Originally this feature
+   was requested as part of the "Installation" tab (with Molecule as its
+   first sub-option), but the user later explicitly split them into two
+   separate nav items — Ansible Molecule and Installation — with
+   Installation kept as the **last** nav item and its own distinct, not-yet-
+   specified purpose (presumably the real cluster install, i.e. running
+   kubespray's own `cluster.yml`, as distinct from role-level testing) —
+   don't invent what goes here, ask when it comes up.
 
 ## etcd backup feature
 
@@ -74,8 +95,10 @@ installs a systemd timer + script on etcd nodes for periodic
 `docker-compose.yml` runs:
 
 - `webui` — this app. Image has `git`, `docker-cli`, `sudo`, `curl`, `wget`,
-  `dpkg-dev` (for `dpkg-scanpackages`), `ansible-core` (pip), and
-  `ENV USER=root` (see offline gotcha #5 below — a real bug, not
+  `dpkg-dev` (for `dpkg-scanpackages`), `ansible-core` + `molecule` +
+  `molecule-plugins[docker]` (pip) + the `community.docker`/`ansible.posix`
+  Galaxy collections (see "Ansible Molecule tab" below for why those two exist),
+  and `ENV USER=root` (see offline gotcha #5 below — a real bug, not
   boilerplate). Bind-mounts `/var/run/docker.sock` (see "Offline Install"
   above/below for why and the risk). `KUBESPRAY_ROOT` env var overrides the
   default `../../kubespray` relative path so it works bare-metal and
@@ -112,15 +135,18 @@ installs a systemd timer + script on etcd nodes for periodic
 ## Git state
 
 - `3761878` Initial commit, `6a22128` "Add Kubespray Version and Offline
-  Install tabs" (the command-builder-only version of that tab) — both
-  pushed to `origin/main`.
-- **Uncommitted, not pushed**: the Offline Install tab's upgrade from
-  command-builder to real execution, then to permanent-services + Python
-  packages + `offline.yml` auto-write (touches `Dockerfile`,
-  `docker-compose.yml`, `backend/main.py`, `backend/offline.py`,
-  `static/app.js`, new `nginx-autoindex.conf`, `CLAUDE.md`). All 5 stages
-  now verified working end-to-end — see "Offline / air-gapped install"
-  below — ask before committing/pushing.
+  Install tabs" (command-builder-only version), `5ee8ea6` "Offline Install:
+  real execution, permanent repos, offline.yml write" — all three pushed to
+  `origin/main`.
+- **Uncommitted, not pushed**: the vertical sidebar nav + new Ansible
+  Molecule tab (real Molecule role tests) + an empty placeholder
+  Installation tab (split out from Molecule per the user's request, kept
+  last, content TBD) — touches `Dockerfile`, `backend/main.py`, new
+  `backend/molecule_runner.py`, `static/index.html`, `static/app.js`,
+  `static/styles.css`, new `molecule/` directory, `CLAUDE.md`. Both roles
+  (`adduser`, `bastion-ssh-config`) verified working end-to-end — see
+  "Ansible Molecule tab — Molecule role tests" below — ask before
+  committing/pushing.
 - Reminder for next session: the `webui` container bakes `backend`/`static`
   into the image via `COPY` at build time — it does **not** live-reload.
   After any backend/static edit, `docker-compose build webui &&
@@ -358,3 +384,154 @@ both found by hitting them in practice:
   upstream repo, so `git checkout --` doesn't apply to them; had to manually
   restore the commented-out placeholder lines to match `inventory/sample/`'s
   pristine template exactly).
+
+## Ansible Molecule tab — Molecule role tests — reference notes
+
+Separate nav item from **Installation** (last in the nav, empty placeholder,
+content not yet specified — see architecture section above). Originally
+built as part of a single "Installation" tab, then split into two per the
+user's explicit request, keeping Installation as the final nav item.
+
+Runs real Ansible Molecule tests (create → converge → idempotence →
+destroy) against two kubespray roles, via `backend/molecule_runner.py` +
+generalized `_stream_shell`/`_check_not_running` in `backend/main.py`
+(the same locking/streaming/log-persistence mechanism the Offline Install
+tab uses, just parameterized with `locks`/`logs` dicts instead of hardcoded
+to `OFFLINE_STAGE_LOCKS`/`OFFLINE_STAGE_LOGS`). `GET /api/molecule/plan`
++ `POST /api/molecule/run/{role}`; not inventory-scoped (a role test is
+independent of any specific cluster inventory).
+
+**Architecturally load-bearing decision**: all scenario files live in
+**this repo's own `molecule/<role>/molecule/default/`**, not inside the
+managed kubespray checkout. The user was explicit about this mid-session:
+the kubespray checkout can be re-cloned/switched/wiped independently (via
+the Kubespray Version tab), so anything added inside it wouldn't reliably
+survive. The actual role code under test is reached via `ANSIBLE_ROLES_PATH`
+(set by `molecule_command()` in `molecule_runner.py` at invocation time,
+pointed at `<kubespray checkout>/roles`), not baked into any scenario file -
+so the scenario directory itself has zero dependency on the checkout's
+contents beyond that one env var.
+
+**Why not kubespray's own `roles/<role>/molecule/default/` scenarios**:
+every one of them (`container-engine/*`, `bootstrap_os`,
+`bastion-ssh-config`, `adduser`, etc.) uses
+`provisioner.playbooks.create: tests/cloud_playbooks/create-kubevirt.yml`,
+which provisions real VMs via a `packet-ci` role (KubeVirt + Equinix Metal
+cloud credentials) - infra this environment doesn't have. Built new,
+separate scenarios using Molecule's plain **Docker driver** instead (no
+VMs, no cloud), for two simple, non-kernel-level roles: `adduser` (creates
+local users/groups) and `bastion-ssh-config` (templates a config file).
+Each scenario's `converge.yml` is a verbatim **copy** of the role's own
+upstream `default/converge.yml`, not a reference to it -
+`bastion-ssh-config`'s converge.yml uses `{{ playbook_dir }}` to know where
+to write `ssh-bastion.conf`, and that resolves to wherever the *executing*
+file physically lives; referencing the upstream file directly would make
+the role write its output into the kubespray checkout's own
+`roles/bastion-ssh-config/molecule/default/` as a side effect, cross-
+contaminating our scenario with upstream's.
+
+Dockerfile needs `molecule` + `molecule-plugins[docker]` (pip) **and** the
+`community.docker`/`ansible.posix` Galaxy collections
+(`ansible-galaxy collection install ...`) - `ansible-core` alone
+deliberately ships no community collections (same reasoning as the offline
+`generate_list.sh` gotcha), but the docker driver's actual create/destroy
+logic is implemented as `community.docker.*` Ansible modules, not pure
+Python - pip alone isn't enough.
+
+### Gotchas found (all fixed) — found by actually running each role's test, not by inspection
+
+1. **Molecule's scenario-discovery convention needs an extra nesting
+   level.** First attempt put scenario files flat at
+   `molecule/<role>/molecule.yml` - running `molecule test` from that
+   directory produced `CRITICAL 'molecule/default/molecule.yml' glob
+   failed. Exiting.` Molecule always looks for
+   `<cwd>/molecule/<scenario-name>/molecule.yml` relative to wherever it's
+   invoked - fixed by nesting one level deeper:
+   `molecule/<role>/molecule/default/{molecule.yml,converge.yml}`.
+2. **Missing Galaxy collections weren't caught by a normal rebuild.** After
+   adding `ansible-galaxy collection install community.docker ansible.posix`
+   to the Dockerfile, a normal `docker-compose build webui` still produced
+   an image with *no* collections installed (confirmed via
+   `ansible-galaxy collection list` / `find ... ansible_collections`
+   inside the running container coming back empty), even though running
+   the identical install command manually via `docker exec` on that same
+   container worked fine. Root cause not fully pinned down (a Docker
+   build-cache layer-reuse quirk, BuildKit not invalidating the layer
+   despite the Dockerfile text changing) - reliably fixed with
+   `docker-compose build --no-cache webui`. If a future Dockerfile RUN-step
+   edit seems to silently not take effect, try `--no-cache` before assuming
+   the code/config itself is wrong.
+3. **`command: ""` + `privileged: true` + `cgroupns_mode: host` doesn't
+   boot reliably on this host's WSL2 kernel.** The initial scenario design
+   copied kubespray convention (heavy systemd/Docker-in-Docker base image,
+   `geerlingguy/docker-ubuntu2204-ansible`, with `command: ""` meant to let
+   its default CMD - `/lib/systemd/systemd` - run under privileged+cgroup
+   mount). On this host, that combination produces a container that starts,
+   runs briefly, but doesn't stay reliably reachable - the "Wait for
+   instance(s) creation to complete" task retried for its full ~300-retry
+   budget once (that specific hang traced separately to a slow first-time
+   image pull, see gotcha #4), and a subsequent real converge attempt got
+   `[ERROR] Task failed: Failed to create temporary directory` (the
+   `docker exec`-based connection couldn't reliably create
+   `~/.ansible/tmp` under systemd-as-PID1). Neither `adduser` nor
+   `bastion-ssh-config` needs systemd or nested Docker at all - fixed by
+   dropping `command`/`privileged`/`cgroupns_mode`/the cgroup volume mount
+   entirely from both scenarios' `molecule.yml`, letting Molecule's docker
+   driver fall back to its own plain keep-alive
+   (`bash -c "while true; do sleep 10000; done"`). Confirmed via direct
+   `docker run`/`docker exec` reproduction: the same image without
+   privileged/systemd overrides starts and stays exec-able instantly;
+   with them, `docker run` either errors outright (an empty-string `Cmd`
+   override is a distinct, separate foot-gun - see below) or exits
+   immediately (255) once systemd fails to initialize under this kernel.
+4. **A ~1.37GB first-time image pull looked indistinguishable from a
+   stuck/broken run for several minutes.** `docker images`/`docker events`
+   showed nothing for a long stretch (the "Wait for instance(s) creation"
+   task's retry loop is itself the async-poll for the underlying pull+create
+   job, so nothing shows as "changed" until the whole thing - pull included
+   - finishes) - confirmed genuinely still-alive (not hung) via
+   `docker top <webui container>` showing live CPU on the
+   `AnsiballZ_docker_container.py`/`ansible-playbook` process tree across
+   multiple checks, then confirmed it really was just a slow pull by
+   running `docker pull geerlingguy/docker-ubuntu2204-ansible:latest`
+   directly on the host and watching it complete. Not a bug - just don't
+   mistake a slow first pull (only pays this cost once; the layer is
+   cached afterward) for a stuck run without checking `docker top` and a
+   direct host-side pull first.
+5. **`command: ""` in `molecule.yml` is not the same as omitting
+   `command`.** Manually reproduced via plain `docker run ... ""`: Docker's
+   API takes a literal empty-string `Cmd` override at face value and fails
+   with `exec: "": executable file not found in $PATH` - `command: ""`
+   does not mean "use the image's default CMD," it means "run an empty
+   string as the command." (Molecule's own `create.yml` uses
+   `item.command | default(...)` which only substitutes on *undefined*,
+   not on empty-string - so an explicit `command: ""` in `molecule.yml`
+   is a real foot-gun, distinct from just leaving the key out.) Resolved
+   as a side effect of gotcha #3's fix (dropping `command` entirely).
+6. **`bastion-ssh-config`'s converge.yml needs a `bastion` group and
+   specific hostvars our single-container scenario doesn't get for free.**
+   The role's `tasks/main.yml` directly reads
+   `hostvars[groups['bastion'][0]]['ansible_host'|'ansible_ssh_host']` and
+   `ansible_user` - none of which Molecule's docker driver sets
+   automatically (its containers connect via `docker exec`, not a real
+   address/SSH user). Fixed by adding a `provisioner.inventory` block to
+   `bastion-ssh-config`'s `molecule.yml` that puts the single `instance`
+   host into a `bastion` group with explicit `ansible_host`/`ansible_port`/
+   `ansible_user: root` hostvars (mirroring how kubespray's own upstream
+   scenario puts its one VM in a `bastion` group too) - matches upstream's
+   pattern of "the bastion tests against itself," and the actual values
+   don't matter since the role only templates a local file
+   (`delegate_to: localhost`), it never really SSHes anywhere during this
+   converge.
+
+### Verification status — both roles confirmed working end-to-end (2026-07-11)
+
+- **adduser**: `SCENARIO RECAP` `successful=6, failed=0`, exit code 0 -
+  create → converge → idempotence → destroy all passed.
+- **bastion-ssh-config**: same, `successful=6, failed=0`, exit code 0,
+  including a genuine idempotence pass (`changed=0` on the second
+  converge run). Confirmed via `git status --porcelain` + directory mtime
+  comparison that no file was written into the kubespray checkout's own
+  `roles/bastion-ssh-config/molecule/default/` during the run (proves the
+  copied-not-referenced `converge.yml` decision in gotcha #6 avoided
+  cross-contamination as intended).

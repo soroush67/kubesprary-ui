@@ -1,0 +1,33 @@
+---
+# Docker-driver Molecule scenario for kubespray's "adduser" role. Lives here
+# (kubespray-webui), not inside the kubespray checkout - the checkout can be
+# re-cloned/switched/wiped (see the "Kubespray Version" tab), and anything
+# we add inside it would be lost. The actual role code is reached via
+# ANSIBLE_ROLES_PATH, set by backend/molecule_runner.py when it invokes
+# `molecule test`, not baked in here - see that file for why.
+#
+# Not kubespray's own roles/adduser/molecule/default/ scenario: that one
+# provisions real VMs via KubeVirt + Equinix Metal cloud credentials, which
+# this environment doesn't have. This scenario re-uses the same converge.yml
+# (copied verbatim) against a plain Docker container instead.
+driver:
+  name: docker
+platforms:
+  # adduser only creates local users/groups - no systemd/nested-docker
+  # needed, so no privileged/cgroup mount. (An earlier version set
+  # command: "" plus privileged+cgroup to boot this image's default systemd
+  # CMD, which doesn't come up reliably on this host's WSL2 kernel and
+  # isn't needed here anyway - omitting `command` lets Molecule's docker
+  # driver fall back to its own plain
+  # `bash -c "while true; do sleep 10000; done"` keep-alive instead.)
+  - name: instance
+    image: "geerlingguy/docker-ubuntu2204-ansible:latest"
+    pre_build_image: true
+provisioner:
+  name: ansible
+  config_options:
+    defaults:
+      callbacks_enabled: profile_tasks
+      timeout: 120
+verifier:
+  name: ansible
