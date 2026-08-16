@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+import cilium as cil
 import hosts_inventory as hv
 import molecule_runner as mol
 import offline as off
@@ -708,6 +710,216 @@ def verify_installation(inv: str, payload: InstallPayload):
     command += _auth_flags(payload)
     return StreamingResponse(
         _stream_shell(command, KUBESPRAY_ROOT, lock, inv, VERIFY_LOGS),
+        media_type="text/plain",
+    )
+
+
+# --- Cilium tab: install/upgrade Cilium via Helm, real execution, plus a
+# real `cilium connectivity test` and a per-node status view. Inventory-
+# scoped like Installation (Cilium targets one specific cluster's control
+# plane). Deliberately bypasses ansible-playbook for the two long-running
+# actions (install, connectivity test) - see cilium.py's module docstring
+# for why (ansible's shell/command modules buffer a whole task's output
+# until it finishes, which would make the UI look hung for however many
+# minutes those take). Both run as raw SSH commands instead, streamed
+# through the same _stream_shell() every other real-execution tab uses.
+CILIUM_INSTALL_LOCKS: dict[str, asyncio.Lock] = {}
+CILIUM_INSTALL_LOGS: dict[str, str] = {}
+CILIUM_UNINSTALL_LOGS: dict[str, str] = {}
+CILIUM_CONNECTIVITY_LOCKS: dict[str, asyncio.Lock] = {}
+CILIUM_CONNECTIVITY_LOGS: dict[str, str] = {}
+
+
+# Which of the two actions sharing CILIUM_INSTALL_LOCKS is the current/most
+# recent lock holder for a given inventory - since they share one lock (see
+# below), the lock's own .locked() alone can't tell the frontend which
+# button to show as "running".
+CILIUM_ACTIVE_ACTION: dict[str, str | None] = {}
+
+
+def _cilium_install_lock(inv: str) -> asyncio.Lock:
+    # Install and uninstall share this one lock (not just install) - they're
+    # mutually exclusive actions on the same underlying Helm release, and
+    # letting one run while the other starts would race on it.
+    if inv not in CILIUM_INSTALL_LOCKS:
+        CILIUM_INSTALL_LOCKS[inv] = asyncio.Lock()
+        CILIUM_INSTALL_LOGS[inv] = ""
+        CILIUM_UNINSTALL_LOGS[inv] = ""
+        CILIUM_ACTIVE_ACTION[inv] = None
+    return CILIUM_INSTALL_LOCKS[inv]
+
+
+def _cilium_connectivity_lock(inv: str) -> asyncio.Lock:
+    if inv not in CILIUM_CONNECTIVITY_LOCKS:
+        CILIUM_CONNECTIVITY_LOCKS[inv] = asyncio.Lock()
+        CILIUM_CONNECTIVITY_LOGS[inv] = ""
+    return CILIUM_CONNECTIVITY_LOCKS[inv]
+
+
+class CiliumAuthPayload(BaseModel):
+    ssh_user: str | None = None
+    auth_method: str = "publickey"  # "publickey" | "password"
+    ssh_password: str | None = None
+
+
+class CiliumInstallPayload(CiliumAuthPayload):
+    confirm: bool = False
+    cilium_version: str
+    values_yaml: str = ""
+
+
+class CiliumUninstallPayload(CiliumAuthPayload):
+    confirm: bool = False
+
+
+def _resolve_cilium_host(inv: str, inv_dir: Path) -> dict:
+    try:
+        return cil.resolve_control_plane_host(KUBESPRAY_ROOT, inv, off.inventory_file(inv_dir))
+    except cil.CiliumError as e:
+        raise HTTPException(400, str(e))
+
+
+async def _run_quick_ssh(cmd: str, timeout: int = 30) -> str:
+    """For the two fast, read-only Cilium actions (list versions, per-node
+    status) - not locked/logged like the long-running ones, just a plain
+    await with a timeout, since nothing here can be usefully "in progress"
+    for more than a few seconds."""
+    proc = await asyncio.create_subprocess_shell(
+        cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise HTTPException(504, "Command timed out - is the control-plane host reachable?")
+    text = stdout.decode(errors="replace")
+    if proc.returncode != 0:
+        raise HTTPException(502, f"Command failed (exit {proc.returncode}): {text[-2000:]}")
+    return text
+
+
+@app.get("/api/inventories/{inv}/cilium/plan")
+def cilium_plan(inv: str):
+    _inventory_dir(inv)
+    install_lock = _cilium_install_lock(inv)
+    conn_lock = _cilium_connectivity_lock(inv)
+    active = CILIUM_ACTIVE_ACTION.get(inv)
+    return {
+        "install_running": install_lock.locked() and active == "install", "install_log": CILIUM_INSTALL_LOGS[inv],
+        "uninstall_running": install_lock.locked() and active == "uninstall", "uninstall_log": CILIUM_UNINSTALL_LOGS[inv],
+        "connectivity_running": conn_lock.locked(), "connectivity_log": CILIUM_CONNECTIVITY_LOGS[inv],
+    }
+
+
+@app.post("/api/inventories/{inv}/cilium/versions")
+async def cilium_versions(inv: str, payload: CiliumAuthPayload):
+    inv_dir = _inventory_dir(inv)
+    _validate_auth(payload)
+    host = _resolve_cilium_host(inv, inv_dir)
+    cmd = cil.versions_command(host, payload.ssh_user, payload.auth_method, payload.ssh_password)
+    # First call on a given host also installs helm + the cilium CLI (see
+    # cilium.py's remote preamble) - that download can take well over 60s
+    # on a slow connection (hit this directly: the call timed out at 60s,
+    # but the remote install had actually kept going and completed anyway,
+    # confirmed via a manual re-run finding both binaries already present).
+    # Later calls skip the download and finish in a couple seconds.
+    raw = await _run_quick_ssh(cmd, timeout=180)
+    try:
+        # rindex, not index: the sudo password prompt itself
+        # ("[sudo] password for ...") contains a literal "[" that comes
+        # *before* the real JSON in the combined stdout+stderr stream - the
+        # actual `helm search ... -o json` output is one flat array (a
+        # single top-level "["), so the *last* "[" in the whole capture is
+        # reliably where it starts. Hit this directly: index() picked the
+        # "[sudo]" bracket instead, truncating the real JSON.
+        entries = json.loads(raw[raw.rindex("["):])
+    except (ValueError, json.JSONDecodeError):
+        raise HTTPException(502, f"Couldn't parse `helm search` output: {raw[-2000:]}")
+    versions = [e["version"] for e in entries]
+    return {"versions": versions}
+
+
+@app.post("/api/inventories/{inv}/cilium/node-status")
+async def cilium_node_status(inv: str, payload: CiliumAuthPayload):
+    inv_dir = _inventory_dir(inv)
+    _validate_auth(payload)
+    host = _resolve_cilium_host(inv, inv_dir)
+    cmd = cil.node_status_command(host, payload.ssh_user, payload.auth_method, payload.ssh_password)
+    raw = await _run_quick_ssh(cmd, timeout=30)
+    try:
+        pods = json.loads(raw[raw.index("{"):])["items"]
+    except (ValueError, json.JSONDecodeError, KeyError):
+        raise HTTPException(502, f"Couldn't parse `kubectl get pods` output: {raw[-2000:]}")
+    nodes = []
+    for pod in pods:
+        statuses = pod.get("status", {}).get("containerStatuses", [{}])
+        ready = all(s.get("ready") for s in statuses) if statuses else False
+        image = statuses[0].get("image", "") if statuses else ""
+        version = image.rsplit(":", 1)[-1] if ":" in image else ""
+        nodes.append({
+            "node": pod.get("spec", {}).get("nodeName", "?"),
+            "pod": pod.get("metadata", {}).get("name", "?"),
+            "phase": pod.get("status", {}).get("phase", "?"),
+            "ready": ready,
+            "restarts": sum(s.get("restartCount", 0) for s in statuses),
+            "version": version,
+            "started": pod.get("status", {}).get("startTime", ""),
+        })
+    return {"nodes": nodes}
+
+
+@app.post("/api/inventories/{inv}/cilium/install")
+def cilium_install(inv: str, payload: CiliumInstallPayload):
+    inv_dir = _inventory_dir(inv)
+    # Changes cluster networking cluster-wide - a stray click here is a real
+    # problem, same reasoning as the Installation tab's own confirm gate.
+    if not payload.confirm:
+        raise HTTPException(400, "Confirmation required to install/upgrade Cilium.")
+    _validate_auth(payload)
+    if not payload.cilium_version:
+        raise HTTPException(400, "A Cilium version is required.")
+    host = _resolve_cilium_host(inv, inv_dir)
+    lock = _check_not_running(inv, CILIUM_INSTALL_LOCKS)
+    CILIUM_ACTIVE_ACTION[inv] = "install"
+    cmd = cil.install_command(
+        host, payload.ssh_user, payload.auth_method, payload.ssh_password,
+        payload.cilium_version, payload.values_yaml,
+    )
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT, lock, inv, CILIUM_INSTALL_LOGS),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/cilium/uninstall")
+def cilium_uninstall(inv: str, payload: CiliumUninstallPayload):
+    inv_dir = _inventory_dir(inv)
+    # Completely removes Cilium, including clearing finalizers on any
+    # stuck CRD instances - a real, hard-to-reverse action (existing pods
+    # lose networking until something else provides a CNI), same reasoning
+    # as the install confirm gate.
+    if not payload.confirm:
+        raise HTTPException(400, "Confirmation required to uninstall Cilium.")
+    _validate_auth(payload)
+    host = _resolve_cilium_host(inv, inv_dir)
+    lock = _check_not_running(inv, CILIUM_INSTALL_LOCKS)
+    CILIUM_ACTIVE_ACTION[inv] = "uninstall"
+    cmd = cil.uninstall_command(host, payload.ssh_user, payload.auth_method, payload.ssh_password)
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT, lock, inv, CILIUM_UNINSTALL_LOGS),
+        media_type="text/plain",
+    )
+
+
+@app.post("/api/inventories/{inv}/cilium/connectivity-test")
+def cilium_connectivity_test(inv: str, payload: CiliumAuthPayload):
+    inv_dir = _inventory_dir(inv)
+    _validate_auth(payload)
+    host = _resolve_cilium_host(inv, inv_dir)
+    lock = _check_not_running(inv, CILIUM_CONNECTIVITY_LOCKS)
+    cmd = cil.connectivity_test_command(host, payload.ssh_user, payload.auth_method, payload.ssh_password)
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT, lock, inv, CILIUM_CONNECTIVITY_LOGS),
         media_type="text/plain",
     )
 

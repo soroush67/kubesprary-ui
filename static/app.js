@@ -92,6 +92,7 @@ const TOP_TABS = {
   offline: "offlineTabBtn",
   molecule: "moleculeTabBtn",
   installation: "installationTabBtn",
+  cilium: "ciliumTabBtn",
 };
 
 async function init() {
@@ -105,6 +106,7 @@ async function init() {
   el("#offlineTabBtn").addEventListener("click", () => switchTab("offline"));
   el("#moleculeTabBtn").addEventListener("click", () => switchTab("molecule"));
   el("#installationTabBtn").addEventListener("click", () => switchTab("installation"));
+  el("#ciliumTabBtn").addEventListener("click", () => switchTab("cilium"));
   searchInput.addEventListener("input", debounce(onSearch, 250));
   document.addEventListener("click", (e) => {
     if (!searchResults.contains(e.target) && e.target !== searchInput) {
@@ -140,6 +142,8 @@ async function switchTab(tab) {
     await loadMolecule();
   } else if (tab === "installation") {
     await loadInstallation();
+  } else if (tab === "cilium") {
+    await loadCilium();
   } else {
     renderSidebar();
     if (state.currentPath === HOSTS_VIEW) {
@@ -1907,6 +1911,679 @@ function renderInstallation(data) {
       running: data.running, log: data.log,
       connectivity_running: data.connectivity_running, connectivity_log: data.connectivity_log,
       verify_running: data.verify_running, verify_log: data.verify_log,
+    }), 4000);
+  }
+}
+
+// ---------- Cilium (install/upgrade via Helm, connectivity test, per-node status) ----------
+// Separate from Installation - this manages Cilium's own lifecycle via Helm,
+// independent of whichever CNI (if any) cluster.yml itself set up. Real
+// execution, streamed, same pattern as Installation - but bypasses
+// ansible-playbook for install/connectivity-test specifically (see
+// backend/cilium.py's module docstring for why: ansible's shell/command
+// modules buffer a whole task's output until it finishes, which would make
+// a multi-minute helm upgrade or connectivity test look hung with no
+// progress). Both stream via the same backend _stream_shell() everything
+// else already uses, just fed by a raw SSH command instead of ansible.
+
+if (!state.ciliumInstallLog) state.ciliumInstallLog = "";
+if (!state.ciliumUninstallLog) state.ciliumUninstallLog = "";
+if (!state.ciliumConnectivityLog) state.ciliumConnectivityLog = "";
+if (!state.ciliumForm) {
+  state.ciliumForm = {
+    sshUser: "", authMethod: "publickey", sshPassword: "",
+    version: "",
+    routingMode: "tunnel", tunnelProtocol: "vxlan",
+    kubeProxyReplacement: false,
+    k8sServiceHost: "", k8sServicePort: "6443",
+    hubbleEnabled: true, hubbleRelayEnabled: true, hubbleUiEnabled: false,
+    encryptionEnabled: false, encryptionType: "wireguard",
+    ipamMode: "cluster-pool",
+    clusterName: "default", clusterId: "0",
+    valuesYaml: "",
+  };
+}
+
+// Generates a values.yaml from the curated fields - a starting point the
+// user can hand-edit afterward in the actual (separate) values.yaml
+// textarea, which is what really gets sent on install, not these fields
+// directly. Only overwrites the textarea when the user clicks "Generate",
+// never automatically, so manual edits are never silently discarded.
+function buildCiliumValuesYaml() {
+  const f = state.ciliumForm;
+  const lines = [];
+  lines.push(`cluster:`);
+  lines.push(`  name: "${f.clusterName}"`);
+  lines.push(`  id: ${f.clusterId}`);
+  lines.push(`routingMode: "${f.routingMode}"`);
+  if (f.routingMode === "tunnel") {
+    lines.push(`tunnelProtocol: "${f.tunnelProtocol}"`);
+  } else {
+    lines.push(`autoDirectNodeRoutes: true`);
+  }
+  lines.push(`kubeProxyReplacement: ${f.kubeProxyReplacement}`);
+  if (f.kubeProxyReplacement) {
+    // Required once kube-proxy replacement is on and kube-proxy itself
+    // isn't running - Cilium needs to know the API server address directly
+    // instead of discovering it via the (now absent) kube-proxy-managed
+    // Service. Get this wrong and cilium-agent won't come up at all.
+    if (f.k8sServiceHost) lines.push(`k8sServiceHost: "${f.k8sServiceHost}"`);
+    lines.push(`k8sServicePort: ${f.k8sServicePort}`);
+  }
+  lines.push(`ipam:`);
+  lines.push(`  mode: "${f.ipamMode}"`);
+  lines.push(`hubble:`);
+  lines.push(`  enabled: ${f.hubbleEnabled}`);
+  lines.push(`  relay:`);
+  lines.push(`    enabled: ${f.hubbleEnabled && f.hubbleRelayEnabled}`);
+  lines.push(`  ui:`);
+  lines.push(`    enabled: ${f.hubbleEnabled && f.hubbleUiEnabled}`);
+  lines.push(`encryption:`);
+  lines.push(`  enabled: ${f.encryptionEnabled}`);
+  if (f.encryptionEnabled) {
+    lines.push(`  type: "${f.encryptionType}"`);
+  }
+  return lines.join("\n") + "\n";
+}
+
+function ciliumAuthPayload() {
+  const f = state.ciliumForm;
+  return {
+    ssh_user: f.sshUser || null,
+    auth_method: f.authMethod,
+    ssh_password: f.authMethod === "password" ? f.sshPassword : null,
+  };
+}
+
+function ciliumNeedsPassword() {
+  const f = state.ciliumForm;
+  if (f.authMethod === "password" && !f.sshPassword) {
+    showToast("Enter a password, or switch to Public key auth.", "error");
+    return true;
+  }
+  return false;
+}
+
+async function loadCilium() {
+  content.innerHTML = `<div class="empty-state"><p>Checking Cilium status…</p></div>`;
+  try {
+    const data = await api(`/api/inventories/${state.inventory}/cilium/plan`);
+    renderCilium(data);
+  } catch (e) {
+    content.innerHTML = "";
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+async function pollCiliumRunning(previousSnapshot) {
+  if (state.topTab !== "cilium") return;
+  try {
+    const freshData = await api(`/api/inventories/${state.inventory}/cilium/plan`);
+    const snapshot = {
+      install_running: freshData.install_running, install_log: freshData.install_log,
+      uninstall_running: freshData.uninstall_running, uninstall_log: freshData.uninstall_log,
+      connectivity_running: freshData.connectivity_running, connectivity_log: freshData.connectivity_log,
+    };
+    const changed = JSON.stringify(snapshot) !== JSON.stringify(previousSnapshot);
+    if (changed) {
+      preserveScroll(["ciliumInstallLog", "ciliumUninstallLog", "ciliumConnectivityLog"], () => renderCilium(freshData));
+    } else if (freshData.install_running || freshData.uninstall_running || freshData.connectivity_running) {
+      setTimeout(() => pollCiliumRunning(snapshot), 4000);
+    }
+  } catch (e) {
+    // Transient - the next manual tab switch/reload will surface real errors.
+  }
+}
+
+async function refreshCiliumVersions(selectEl, btn) {
+  if (ciliumNeedsPassword()) return;
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Loading…";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/cilium/versions`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ciliumAuthPayload()),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    selectEl.innerHTML = "";
+    for (const v of data.versions) {
+      const opt = document.createElement("option");
+      opt.value = v;
+      opt.textContent = v;
+      selectEl.appendChild(opt);
+    }
+    if (data.versions.length) {
+      state.ciliumForm.version = data.versions[0];
+      selectEl.value = data.versions[0];
+    }
+    showToast(`Loaded ${data.versions.length} version(s).`, "success");
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function renderCiliumNodeTable(tableEl, nodes) {
+  if (!nodes.length) {
+    tableEl.innerHTML = `<div class="empty-state"><p>No cilium-agent pods found - is Cilium installed on this inventory?</p></div>`;
+    return;
+  }
+  const rows = nodes.map((n) => `
+    <tr>
+      <td>${escapeHtml(n.node)}</td>
+      <td>${n.ready ? "✅ Ready" : "❌ Not ready"}</td>
+      <td>${escapeHtml(n.phase)}</td>
+      <td>${escapeHtml(n.version || "?")}</td>
+      <td>${n.restarts}</td>
+      <td>${escapeHtml(n.started || "")}</td>
+    </tr>`).join("");
+  tableEl.innerHTML = `
+    <table class="data-table">
+      <thead><tr><th>Node</th><th>Status</th><th>Phase</th><th>Version</th><th>Restarts</th><th>Started</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+}
+
+async function refreshCiliumNodeStatus(tableEl, btn) {
+  if (ciliumNeedsPassword()) return;
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Loading…";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/cilium/node-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ciliumAuthPayload()),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || res.statusText);
+    renderCiliumNodeTable(tableEl, data.nodes);
+    showToast(`${data.nodes.length} node(s).`, "success");
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function runCiliumInstall(logEl, btn) {
+  const f = state.ciliumForm;
+  if (ciliumNeedsPassword()) return;
+  if (!f.version) {
+    showToast("Pick a Cilium version first (Refresh versions).", "error");
+    return;
+  }
+  if (!confirm(
+    `Really install/upgrade Cilium ${f.version} on inventory "${state.inventory}"? ` +
+    `This changes cluster networking - existing pods may briefly lose connectivity while cilium-agent restarts on every node.`
+  )) return;
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.ciliumInstallLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/cilium/install`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        ...ciliumAuthPayload(),
+        confirm: true,
+        cilium_version: f.version,
+        values_yaml: f.valuesYaml,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.ciliumInstallLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const code = parseExitCode(state.ciliumInstallLog);
+    if (code === 0) {
+      showToast("Cilium install/upgrade finished successfully.", "success");
+    } else {
+      showToast(`Cilium install/upgrade failed (exit code ${code}) - check the log.`, "error");
+    }
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function runCiliumUninstall(logEl, btn) {
+  if (ciliumNeedsPassword()) return;
+  const inv = state.inventory;
+  if (!confirm(
+    `Really COMPLETELY remove Cilium from inventory "${inv}"? ` +
+    `This runs helm uninstall, then clears finalizers on and deletes every Cilium custom resource and CRD in the cluster - ` +
+    `pods will lose networking until another CNI (or Cilium again) is installed. There is no undo.`
+  )) return;
+  if (prompt(`Type the inventory name ("${inv}") to confirm this irreversible removal:`) !== inv) {
+    showToast("Cancelled - inventory name didn't match.", "error");
+    return;
+  }
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Removing…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.ciliumUninstallLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/cilium/uninstall`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...ciliumAuthPayload(), confirm: true }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.ciliumUninstallLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const code = parseExitCode(state.ciliumUninstallLog);
+    if (code === 0) {
+      showToast("Cilium removed completely.", "success");
+    } else {
+      showToast(`Cilium removal hit a problem (exit code ${code}) - check the log.`, "error");
+    }
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function runCiliumConnectivityTest(logEl, btn) {
+  if (ciliumNeedsPassword()) return;
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "Running…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.ciliumConnectivityLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/cilium/connectivity-test`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(ciliumAuthPayload()),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.ciliumConnectivityLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const code = parseExitCode(state.ciliumConnectivityLog);
+    if (code === 0) {
+      showToast("Cilium connectivity test passed.", "success");
+    } else {
+      showToast(`Cilium connectivity test found problems (exit code ${code}) - check the log.`, "error");
+    }
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+function renderCilium(data) {
+  const f = state.ciliumForm;
+  const wrap = document.createElement("div");
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2>Cilium (Helm)</h2><span class="path">inventory/${state.inventory}</span>`;
+  wrap.appendChild(header);
+
+  const desc = document.createElement("div");
+  desc.className = "file-desc";
+  desc.textContent = "Installs/upgrades Cilium via Helm on this inventory's control-plane host, independent of whichever CNI (if any) cluster.yml itself set up.";
+  wrap.appendChild(desc);
+
+  const dangerBanner = document.createElement("div");
+  dangerBanner.className = "ops-note danger";
+  dangerBanner.textContent = "This changes real cluster networking. If another CNI is already active on this cluster, installing Cilium alongside it can conflict - make sure that's intended before running this.";
+  wrap.appendChild(dangerBanner);
+
+  // --- auth fields (same shape/pattern as the Installation tab) ---
+  const authForm = document.createElement("div");
+  authForm.className = "ops-fields";
+
+  const userInput = document.createElement("input");
+  userInput.type = "text";
+  userInput.placeholder = "(defaults to inventory's ansible_user)";
+  userInput.value = f.sshUser;
+  userInput.addEventListener("input", () => { f.sshUser = userInput.value; });
+
+  const keyRadio = document.createElement("input");
+  keyRadio.type = "radio";
+  keyRadio.name = "ciliumAuthMethod";
+  keyRadio.checked = f.authMethod === "publickey";
+  const passRadio = document.createElement("input");
+  passRadio.type = "radio";
+  passRadio.name = "ciliumAuthMethod";
+  passRadio.checked = f.authMethod === "password";
+
+  const passwordInput = document.createElement("input");
+  passwordInput.type = "password";
+  passwordInput.placeholder = "SSH + sudo password";
+  passwordInput.value = f.sshPassword;
+  passwordInput.disabled = f.authMethod !== "password";
+  passwordInput.addEventListener("input", () => { f.sshPassword = passwordInput.value; });
+
+  keyRadio.addEventListener("change", () => { f.authMethod = "publickey"; passwordInput.disabled = true; });
+  passRadio.addEventListener("change", () => { f.authMethod = "password"; passwordInput.disabled = false; });
+
+  authForm.appendChild(opsField("SSH user (-u)", userInput));
+  authForm.appendChild(opsField("Public key (uses this host's mounted SSH keys)", keyRadio));
+  authForm.appendChild(opsField("Password", passRadio));
+  authForm.appendChild(opsField("Password value", passwordInput));
+  wrap.appendChild(authForm);
+
+  // --- version selector ---
+  const versionRow = document.createElement("div");
+  versionRow.className = "ops-fields";
+  const versionSelect = document.createElement("select");
+  if (f.version) {
+    const opt = document.createElement("option");
+    opt.value = f.version;
+    opt.textContent = f.version;
+    versionSelect.appendChild(opt);
+  }
+  versionSelect.addEventListener("change", () => { f.version = versionSelect.value; });
+  const refreshVersionsBtn = document.createElement("button");
+  refreshVersionsBtn.className = "btn-secondary";
+  refreshVersionsBtn.textContent = "🔄 Refresh versions";
+  refreshVersionsBtn.addEventListener("click", () => refreshCiliumVersions(versionSelect, refreshVersionsBtn));
+  versionRow.appendChild(opsField("Cilium chart version", versionSelect));
+  const versionBtnRow = document.createElement("div");
+  versionBtnRow.appendChild(refreshVersionsBtn);
+  versionRow.appendChild(versionBtnRow);
+  wrap.appendChild(versionRow);
+
+  // --- curated config fields ---
+  const cfgForm = document.createElement("div");
+  cfgForm.className = "ops-fields";
+
+  const routingSelect = document.createElement("select");
+  for (const [val, label] of [["tunnel", "Tunnel (VXLAN/Geneve)"], ["native", "Native routing"]]) {
+    const opt = document.createElement("option");
+    opt.value = val; opt.textContent = label; opt.selected = f.routingMode === val;
+    routingSelect.appendChild(opt);
+  }
+  routingSelect.addEventListener("change", () => { f.routingMode = routingSelect.value; tunnelProtoField.style.display = f.routingMode === "tunnel" ? "" : "none"; });
+
+  const tunnelProtoSelect = document.createElement("select");
+  for (const val of ["vxlan", "geneve"]) {
+    const opt = document.createElement("option");
+    opt.value = val; opt.textContent = val; opt.selected = f.tunnelProtocol === val;
+    tunnelProtoSelect.appendChild(opt);
+  }
+  tunnelProtoSelect.addEventListener("change", () => { f.tunnelProtocol = tunnelProtoSelect.value; });
+  const tunnelProtoField = opsField("Tunnel protocol", tunnelProtoSelect);
+  tunnelProtoField.style.display = f.routingMode === "tunnel" ? "" : "none";
+
+  const kubeProxyCheckbox = document.createElement("input");
+  kubeProxyCheckbox.type = "checkbox";
+  kubeProxyCheckbox.checked = f.kubeProxyReplacement;
+  kubeProxyCheckbox.addEventListener("change", () => {
+    f.kubeProxyReplacement = kubeProxyCheckbox.checked;
+    k8sHostField.style.display = f.kubeProxyReplacement ? "" : "none";
+    k8sPortField.style.display = f.kubeProxyReplacement ? "" : "none";
+  });
+
+  const k8sHostInput = document.createElement("input");
+  k8sHostInput.type = "text";
+  k8sHostInput.placeholder = "e.g. 10.20.30.11 or your API server LB VIP";
+  k8sHostInput.value = f.k8sServiceHost;
+  k8sHostInput.addEventListener("input", () => { f.k8sServiceHost = k8sHostInput.value; });
+  const k8sHostField = opsField("Kubernetes API host (required if kube-proxy replacement is on)", k8sHostInput);
+  k8sHostField.style.display = f.kubeProxyReplacement ? "" : "none";
+
+  const k8sPortInput = document.createElement("input");
+  k8sPortInput.type = "text";
+  k8sPortInput.value = f.k8sServicePort;
+  k8sPortInput.addEventListener("input", () => { f.k8sServicePort = k8sPortInput.value; });
+  const k8sPortField = opsField("Kubernetes API port", k8sPortInput);
+  k8sPortField.style.display = f.kubeProxyReplacement ? "" : "none";
+
+  const hubbleCheckbox = document.createElement("input");
+  hubbleCheckbox.type = "checkbox";
+  hubbleCheckbox.checked = f.hubbleEnabled;
+  hubbleCheckbox.addEventListener("change", () => { f.hubbleEnabled = hubbleCheckbox.checked; });
+
+  const hubbleRelayCheckbox = document.createElement("input");
+  hubbleRelayCheckbox.type = "checkbox";
+  hubbleRelayCheckbox.checked = f.hubbleRelayEnabled;
+  hubbleRelayCheckbox.addEventListener("change", () => { f.hubbleRelayEnabled = hubbleRelayCheckbox.checked; });
+
+  const hubbleUiCheckbox = document.createElement("input");
+  hubbleUiCheckbox.type = "checkbox";
+  hubbleUiCheckbox.checked = f.hubbleUiEnabled;
+  hubbleUiCheckbox.addEventListener("change", () => { f.hubbleUiEnabled = hubbleUiCheckbox.checked; });
+
+  const encryptionCheckbox = document.createElement("input");
+  encryptionCheckbox.type = "checkbox";
+  encryptionCheckbox.checked = f.encryptionEnabled;
+  encryptionCheckbox.addEventListener("change", () => { f.encryptionEnabled = encryptionCheckbox.checked; encryptionTypeField.style.display = f.encryptionEnabled ? "" : "none"; });
+
+  const encryptionTypeSelect = document.createElement("select");
+  for (const val of ["wireguard", "ipsec"]) {
+    const opt = document.createElement("option");
+    opt.value = val; opt.textContent = val; opt.selected = f.encryptionType === val;
+    encryptionTypeSelect.appendChild(opt);
+  }
+  encryptionTypeSelect.addEventListener("change", () => { f.encryptionType = encryptionTypeSelect.value; });
+  const encryptionTypeField = opsField("Encryption type", encryptionTypeSelect);
+  encryptionTypeField.style.display = f.encryptionEnabled ? "" : "none";
+
+  const ipamSelect = document.createElement("select");
+  for (const [val, label] of [["cluster-pool", "Cluster Pool (Cilium-managed)"], ["kubernetes", "Kubernetes (node podCIDR)"]]) {
+    const opt = document.createElement("option");
+    opt.value = val; opt.textContent = label; opt.selected = f.ipamMode === val;
+    ipamSelect.appendChild(opt);
+  }
+  ipamSelect.addEventListener("change", () => { f.ipamMode = ipamSelect.value; });
+
+  const clusterNameInput = document.createElement("input");
+  clusterNameInput.type = "text";
+  clusterNameInput.value = f.clusterName;
+  clusterNameInput.addEventListener("input", () => { f.clusterName = clusterNameInput.value; });
+
+  const clusterIdInput = document.createElement("input");
+  clusterIdInput.type = "text";
+  clusterIdInput.value = f.clusterId;
+  clusterIdInput.addEventListener("input", () => { f.clusterId = clusterIdInput.value; });
+
+  cfgForm.appendChild(opsField("Routing mode", routingSelect));
+  cfgForm.appendChild(tunnelProtoField);
+  cfgForm.appendChild(opsField("kube-proxy replacement", kubeProxyCheckbox));
+  cfgForm.appendChild(k8sHostField);
+  cfgForm.appendChild(k8sPortField);
+  cfgForm.appendChild(opsField("IPAM mode", ipamSelect));
+  cfgForm.appendChild(opsField("Hubble (observability)", hubbleCheckbox));
+  cfgForm.appendChild(opsField("Hubble Relay", hubbleRelayCheckbox));
+  cfgForm.appendChild(opsField("Hubble UI", hubbleUiCheckbox));
+  cfgForm.appendChild(opsField("Encryption", encryptionCheckbox));
+  cfgForm.appendChild(encryptionTypeField);
+  cfgForm.appendChild(opsField("Cluster name", clusterNameInput));
+  cfgForm.appendChild(opsField("Cluster ID", clusterIdInput));
+  wrap.appendChild(cfgForm);
+
+  // --- values.yaml editor (the actual source of truth for install) ---
+  const valuesDesc = document.createElement("div");
+  valuesDesc.className = "file-desc";
+  valuesDesc.textContent = "values.yaml - this exact content is what gets installed, not the fields above directly. \"Generate\" fills it in from the fields; hand-edit freely afterward.";
+  wrap.appendChild(valuesDesc);
+
+  const generateBtn = document.createElement("button");
+  generateBtn.className = "btn-secondary";
+  generateBtn.textContent = "⚙ Generate values.yaml from fields";
+  generateBtn.style.marginBottom = "10px";
+
+  const valuesTextarea = document.createElement("textarea");
+  valuesTextarea.className = "raw-editor";
+  valuesTextarea.style.minHeight = "220px";
+  valuesTextarea.value = f.valuesYaml || buildCiliumValuesYaml();
+  f.valuesYaml = valuesTextarea.value;
+  valuesTextarea.addEventListener("input", () => { f.valuesYaml = valuesTextarea.value; });
+
+  generateBtn.addEventListener("click", () => {
+    if (f.valuesYaml && !confirm("Overwrite the values.yaml editor with fields generated from the form above? Any manual edits will be lost.")) return;
+    const generated = buildCiliumValuesYaml();
+    valuesTextarea.value = generated;
+    f.valuesYaml = generated;
+  });
+
+  wrap.appendChild(generateBtn);
+  wrap.appendChild(valuesTextarea);
+
+  // --- install/upgrade ---
+  const installRow = document.createElement("div");
+  installRow.style.marginTop = "16px";
+  const installBtn = document.createElement("button");
+  installBtn.className = "btn-danger";
+  installBtn.textContent = "⬆ Install / Upgrade Cilium";
+  if (data.install_running) {
+    installBtn.disabled = true;
+    installBtn.textContent = "Running… (started elsewhere)";
+  }
+  const installLogEl = document.createElement("pre");
+  installLogEl.id = "ciliumInstallLog";
+  installLogEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorInstallLog = data.install_log || state.ciliumInstallLog;
+  state.ciliumInstallLog = priorInstallLog || "";
+  installLogEl.textContent = priorInstallLog || "";
+  installLogEl.style.display = priorInstallLog ? "block" : "none";
+  installLogEl.style.marginTop = "10px";
+  installBtn.addEventListener("click", () => runCiliumInstall(installLogEl, installBtn));
+  installRow.appendChild(installBtn);
+  wrap.appendChild(installRow);
+  wrap.appendChild(installLogEl);
+
+  // --- uninstall (complete removal) ---
+  const uninstallDesc = document.createElement("div");
+  uninstallDesc.className = "file-desc";
+  uninstallDesc.textContent = "Completely removes Cilium: helm uninstall, then clears finalizers on and deletes every Cilium custom resource and CRD - nothing left stuck Terminating.";
+  uninstallDesc.style.marginTop = "16px";
+  wrap.appendChild(uninstallDesc);
+
+  const uninstallBanner = document.createElement("div");
+  uninstallBanner.className = "ops-note danger";
+  uninstallBanner.textContent = "Irreversible. Pods lose networking entirely until another CNI (or Cilium again) is installed.";
+  wrap.appendChild(uninstallBanner);
+
+  const uninstallRow = document.createElement("div");
+  const uninstallBtn = document.createElement("button");
+  uninstallBtn.className = "btn-danger";
+  uninstallBtn.textContent = "🗑 Remove Cilium (complete)";
+  if (data.uninstall_running) {
+    uninstallBtn.disabled = true;
+    uninstallBtn.textContent = "Removing… (started elsewhere)";
+  }
+  const uninstallLogEl = document.createElement("pre");
+  uninstallLogEl.id = "ciliumUninstallLog";
+  uninstallLogEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorUninstallLog = data.uninstall_log || state.ciliumUninstallLog;
+  state.ciliumUninstallLog = priorUninstallLog || "";
+  uninstallLogEl.textContent = priorUninstallLog || "";
+  uninstallLogEl.style.display = priorUninstallLog ? "block" : "none";
+  uninstallLogEl.style.marginTop = "10px";
+  uninstallBtn.addEventListener("click", () => runCiliumUninstall(uninstallLogEl, uninstallBtn));
+  uninstallRow.appendChild(uninstallBtn);
+  wrap.appendChild(uninstallRow);
+  wrap.appendChild(uninstallLogEl);
+
+  // --- connectivity test ---
+  const connDesc = document.createElement("div");
+  connDesc.className = "file-desc";
+  connDesc.textContent = "Runs the real `cilium connectivity test` - use it before an upgrade (baseline) and after (verify nothing broke), or any time.";
+  connDesc.style.marginTop = "16px";
+  wrap.appendChild(connDesc);
+
+  const connRow = document.createElement("div");
+  const connBtn = document.createElement("button");
+  connBtn.className = "btn-secondary";
+  connBtn.textContent = "🔌 Test connectivity";
+  if (data.connectivity_running) {
+    connBtn.disabled = true;
+    connBtn.textContent = "Running… (started elsewhere)";
+  }
+  const connLogEl = document.createElement("pre");
+  connLogEl.id = "ciliumConnectivityLog";
+  connLogEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorConnLog = data.connectivity_log || state.ciliumConnectivityLog;
+  state.ciliumConnectivityLog = priorConnLog || "";
+  connLogEl.textContent = priorConnLog || "";
+  connLogEl.style.display = priorConnLog ? "block" : "none";
+  connLogEl.style.marginTop = "10px";
+  connBtn.addEventListener("click", () => runCiliumConnectivityTest(connLogEl, connBtn));
+  connRow.appendChild(connBtn);
+  wrap.appendChild(connRow);
+  wrap.appendChild(connLogEl);
+
+  // --- per-node status ---
+  const nodeDesc = document.createElement("div");
+  nodeDesc.className = "file-desc";
+  nodeDesc.textContent = "Per-node cilium-agent status.";
+  nodeDesc.style.marginTop = "16px";
+  wrap.appendChild(nodeDesc);
+
+  const nodeRow = document.createElement("div");
+  const nodeBtn = document.createElement("button");
+  nodeBtn.className = "btn-secondary";
+  nodeBtn.textContent = "🔄 Refresh node status";
+  const nodeTable = document.createElement("div");
+  nodeTable.style.marginTop = "10px";
+  nodeBtn.addEventListener("click", () => refreshCiliumNodeStatus(nodeTable, nodeBtn));
+  nodeRow.appendChild(nodeBtn);
+  wrap.appendChild(nodeRow);
+  wrap.appendChild(nodeTable);
+
+  content.innerHTML = "";
+  content.appendChild(wrap);
+
+  if (data.install_running || data.uninstall_running || data.connectivity_running) {
+    setTimeout(() => pollCiliumRunning({
+      install_running: data.install_running, install_log: data.install_log,
+      uninstall_running: data.uninstall_running, uninstall_log: data.uninstall_log,
+      connectivity_running: data.connectivity_running, connectivity_log: data.connectivity_log,
     }), 4000);
   }
 }
