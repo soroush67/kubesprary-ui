@@ -116,8 +116,30 @@ def container_images_command(kubespray_root: Path, registry_mode: str, registry_
     # needs no daemon.json changes (Docker treats 127.0.0.0/8 as insecure by default).
     offline_dir = kubespray_root / "contrib" / "offline"
     dest = registry_address if (registry_mode == "remote" and registry_address) else f"localhost:{LOCAL_REGISTRY_PORT}"
+
+    # images.list (generate-lists stage) already has every image prefixed with
+    # whatever registry_host the inventory's offline.yml points at (e.g.
+    # "172.22.120.105:5000/coreos/etcd:v3.6.10") - that's correct, it's what
+    # real cluster nodes need. But create()'s own prefix-stripping only fires
+    # when PRIVATE_REGISTRY exactly matches that prefix; left unset (as
+    # before), container-images.txt keeps the full prefix in its "raw_image"
+    # column, and register() then does `${DESTINATION_REGISTRY}/${raw_image}`
+    # - doubling it into an invalid reference like
+    # "localhost:5000/172.22.120.105:5000/coreos/etcd:v3.6.10" (hit for real:
+    # aborted on the very first image, nothing got registered). Reading the
+    # prefix directly off images.list's own first line - rather than trying
+    # to separately recompute/pass in whatever host_address was configured -
+    # guarantees an exact match by construction, no risk of the two drifting.
+    private_registry = ""
+    images_list = offline_dir / "temp" / "images.list"
+    if images_list.is_file():
+        first_line = next((line for line in images_list.read_text().splitlines() if line.strip()), "")
+        if "/" in first_line:
+            private_registry = first_line.split("/", 1)[0]
+    private_registry_env = f"PRIVATE_REGISTRY={private_registry} " if private_registry else ""
+
     return (
-        f"cd {offline_dir} && IMAGES_FROM_FILE={offline_dir}/temp/images.list "
+        f"cd {offline_dir} && {private_registry_env}IMAGES_FROM_FILE={offline_dir}/temp/images.list "
         f"./manage-offline-container-images.sh create && "
         f"DESTINATION_REGISTRY={dest} ./manage-offline-container-images.sh register"
     )

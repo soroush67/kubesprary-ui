@@ -12,7 +12,7 @@ memorizing ansible-playbook flags.
 - Pushed to `https://github.com/soroush67/kubesprary-ui.git`, branch `main`.
 - Host OS: Ubuntu 24.04.
 
-## Architecture — vertical left-hand nav, 6 destinations
+## Architecture — vertical left-hand nav, 7 destinations
 
 The left side of the page is a two-level layout: `#primaryNav` (5 nav
 buttons, `static/index.html`/`styles.css`'s `.primary-nav`/`.nav-btn`) is
@@ -82,6 +82,15 @@ unchanged in shape from the old horizontal version.
    installs actual Kubernetes components with no undo short of
    `reset.yml`. See "Installation tab — real cluster install" below for
    full design.
+7. **Cilium (Helm)** — installs/upgrades Cilium via Helm directly against
+   the cluster's control plane, independent of whichever CNI (if any)
+   cluster.yml itself set up. Real execution, inventory-scoped, with
+   curated config fields *and* a hand-editable `values.yaml` (the field
+   generate a starting point; the textarea's actual content is what
+   installs), a chart-version picker, a real `cilium connectivity test`,
+   and a per-node cilium-agent status table. See "Cilium tab — Helm
+   install/upgrade" below for full design, including why this bypasses
+   ansible-playbook entirely (unlike every other real-execution tab).
 
 ## etcd backup feature
 
@@ -137,19 +146,17 @@ installs a systemd timer + script on etcd nodes for periodic
 - `3761878` Initial commit, `6a22128` "Add Kubespray Version and Offline
   Install tabs" (command-builder-only version), `5ee8ea6` "Offline Install:
   real execution, permanent repos, offline.yml write", `a72ee8e` "Vertical
-  sidebar nav; add Ansible Molecule tab for real kubespray role tests" —
-  all four pushed to `origin/main`.
-- **Uncommitted, not pushed**: the Installation tab's real implementation
-  (`ansible-playbook cluster.yml` against the selected inventory, with a
-  server-side confirmation gate) — touches `Dockerfile`, `backend/main.py`,
-  `backend/offline.py` (renamed `_inventory_file` → `inventory_file`, now
-  shared across modules), `static/app.js`, `CLAUDE.md`. Real end-to-end run
-  tested against the `soroush` inventory (real IPs, not yet provisioned -
-  see "Installation tab" verification status below for full detail and why
-  `local` was deliberately avoided) - found and fixed 3 real bugs this way
-  (missing `community.general` etc., wrong ansible-core version, a lock
-  KeyError). See "Installation tab —
-  real cluster install" below — ask before committing/pushing.
+  sidebar nav; add Ansible Molecule tab for real kubespray role tests",
+  `794c898` "Installation tab: real cluster.yml execution, SSH auth
+  options, connectivity check", `ad760c9` "Fix real cluster.yml offline
+  image redirect, streaming crash, and log UX bugs" — all six pushed to
+  `origin/main`.
+- **Uncommitted, not pushed**: the new Cilium (Helm) tab — touches
+  `backend/main.py`, new `backend/cilium.py`, `static/app.js`,
+  `static/index.html`, `static/styles.css`, `CLAUDE.md`. See "Cilium tab —
+  Helm install/upgrade" below for full design and verification status
+  (validated everything possible without live hosts - the real cluster's 6
+  hosts are currently unreachable) — ask before committing/pushing.
 - Reminder for next session: the `webui` container bakes `backend`/`static`
   into the image via `COPY` at build time — it does **not** live-reload.
   After any backend/static edit, `docker-compose build webui &&
@@ -381,6 +388,55 @@ both found by hitting them in practice:
    run-completion handler to show an accurate success/error toast instead
    of assuming success. Found directly from the user noticing the
    mismatch: images failed to pull, but the tab reported success anyway.
+10. **(Real bug, now fixed) `container_images_command()` never set
+    `PRIVATE_REGISTRY`, so `register()` double-prefixed every image and
+    aborted on the very first one.** `images.list` (generate-lists stage)
+    already has every image prefixed with whatever `registry_host` the
+    inventory's `offline.yml` points at (e.g.
+    `172.22.120.105:5000/coreos/etcd:v3.6.10` - correct, that's what real
+    cluster nodes need). `create()`'s own prefix-stripping only fires when
+    `PRIVATE_REGISTRY` exactly matches that prefix; left unset (as before),
+    `container-images.txt` kept the full prefix in its "raw_image" column,
+    and `register()` then built `${DESTINATION_REGISTRY}/${raw_image}` -
+    doubling it into an invalid reference
+    (`localhost:5000/172.22.120.105:5000/coreos/etcd:v3.6.10`,
+    `"is not a valid repository/tag: invalid reference format"`), which
+    aborted the whole batch immediately (0/48 registered that run, worse
+    than gotcha #7's partial-batch case). Hit for real by the user, not
+    found by inspection. Fixed by reading the registry prefix directly off
+    `images.list`'s own first line at command-build time (rather than
+    separately recomputing/passing whatever `host_address` was configured
+    via the `offline/configure` endpoint) - guarantees an exact match by
+    construction, no risk of the two drifting - and passing it as
+    `PRIVATE_REGISTRY` to the `create` half of the command. Verified for
+    real: re-ran the stage against `afshin` end-to-end after the fix,
+    `"Succeeded to register container images to local registry."`, exit
+    code 0, all 48/48 images confirmed present in the registry catalog
+    afterward (previously this same inventory had only gotten 26/48 via
+    gotcha #7, and then 0/48 once this double-prefix bug started
+    triggering on every run regardless of which image came first).
+    Separately, while investigating this: 4 of the 48 images in `afshin`'s
+    `images.list` (`metrics-server/metrics-server:v0.8.1`,
+    `rancher/local-path-provisioner:v0.0.32`,
+    `amazon/aws-alb-ingress-controller:v1.1.9`,
+    `amazon/aws-ebs-csi-driver:v0.5.0`) had never actually been mirrored
+    into the local registry at all (likely bundled before
+    `metrics_server_enabled: true` was set in that inventory, or lost to
+    gotcha #7's partial-batch behavior on an earlier run) - mirrored
+    manually with `skopeo copy` (their real upstream registries confirmed
+    from kubespray's own `roles/kubespray_defaults/defaults/main/
+    download.yml` / `addons.yml`, not guessed) since this host has real
+    internet access; not a webui code bug, just a data gap, but worth
+    knowing this class of "silently missing from the mirror" issue can
+    happen and `curl localhost:5000/v2/_catalog` against `images.list` is
+    the way to check for it (same check gotcha #7 already recommends).
+    Also encountered along the way, unrelated to the webui: a stale
+    Docker daemon `insecure-registries` config on the **host** (not this
+    container) caused an earlier, separate failure
+    (`"server gave HTTP response to HTTPS client"`) pulling from
+    `172.22.120.105:5000` directly - fixed at the host level
+    (`/etc/docker/daemon.json` + `live-restore: true` + daemon restart),
+    outside this repo entirely, not a code change here.
 
 ### Verification status — all 5 stages confirmed working end-to-end (2026-07-10)
 
@@ -793,8 +849,217 @@ force a uniform SSH user across a mixed inventory) was tested during
 diagnosis and confirmed working, though the actual fix ended up being in
 the inventory itself rather than needing the override at all.
 
-**Still not run**: an actual full `cluster.yml` install against `afshin` -
-connectivity is now fully confirmed, so this is the next real milestone,
-but it's a large, hard-to-fully-undo action (installs Kubernetes across 6
-real machines) - don't trigger it without the user explicitly asking for
-that specific step.
+**Update**: a real `cluster.yml` install against `afshin` has since been
+attempted several times (with explicit user go-ahead each time), making
+real progress each round - found and fixed real bugs along the way: (1)
+`_stream_shell` crashed with `ValueError: Separator is found, but chunk is
+longer than limit` on a task (`Docker | Get package facts`) that emits one
+huge single-line JSON blob per host - asyncio's line-based stdout
+iteration has a ~64KB per-line cap; fixed by switching to fixed-size
+chunked reads instead (no such limit) - see gotcha in the
+`_stream_shell`/scroll-preservation area of `static/app.js`/`backend/
+main.py` history. (2) The offline registry's `containerd_registries_mirrors`
+override needed an explicit `http://` scheme on the mirror host, and
+`skip_verify: true` set *alongside* `http://` actively confuses containerd
+("host will try HTTPS first since it is configured for HTTP with a TLS
+configuration") - fixed by dropping `skip_verify` once the scheme was
+explicit. The most recent run got past both of these and progressed well
+into the `download`/`container-engine` roles (multiple hosts pulling
+images successfully) before being paused mid-run at the user's explicit
+request - not yet confirmed fully complete (no `PLAY RECAP` with 0 failed
+seen yet). Next step when resumed: just click "▶ Run cluster install"
+again (idempotent, resumable) and watch for a clean recap - or use the
+Verify Cluster button once it looks done.
+- As of this session, the real `afshin` hosts (`192.168.120.160-165`) are
+  **currently unreachable** (checked directly, all 6 time out on port 22) -
+  likely the VMs are simply powered off right now, not a regression in
+  anything here. Nothing to fix; just needs the hosts back up to continue
+  testing against them.
+
+## Cilium tab — Helm install/upgrade — reference notes
+
+Installs/upgrades Cilium via Helm directly against the selected
+inventory's `kube_control_plane[0]` host, independent of whichever CNI (if
+any) `cluster.yml` itself set up. Inventory-scoped, like Installation.
+Three real actions: **install/upgrade**, **connectivity test**
+(`cilium connectivity test`), and **per-node status** (read-only). A chart
+version picker (`helm search repo cilium/cilium --versions`) rounds it out.
+
+**Architecturally different from every other real-execution tab: bypasses
+ansible-playbook entirely for the two long-running actions.** Offline
+Install/Molecule/Installation all stream real command output because
+ansible-playbook itself prints progress task-by-task as it runs. But
+`helm upgrade --install`/`cilium connectivity test` would each be wrapped
+in a *single* `ansible.builtin.shell`/`command` task if run through a
+playbook - and Ansible's shell/command modules buffer a task's entire
+output until the task finishes, so the UI would look hung with zero output
+for however many minutes those commands take (unlike cluster.yml, whose
+many small tasks each produce visible progress along the way). Fixed by
+not using ansible-playbook for these two at all: `backend/cilium.py`
+resolves the target host via a single `ansible-inventory --list` call
+(works correctly for both INI and YAML inventories, unlike
+`hosts_inventory.py`'s YAML-only parser, which only the Files tab uses),
+then builds a raw SSH command whose stdout streams naturally through the
+same `_stream_shell()` every other tab already uses.
+
+**The `sudo -S` + piped-script pattern this relies on** (`backend/
+cilium.py`'s `_wrap_remote_script()`): the remote command is
+`ssh host sudo -S bash -s <<'EOF' ... EOF`, i.e. the SSH command's local
+heredoc feeds `sudo -S bash -s`'s stdin with the sudo password as the
+*first line*, followed immediately by the actual remote script. This
+works because `sudo -S` reads exactly one line from stdin for the
+password, then hands the rest of that same stream to the child process
+(`bash -s`) to read as its script - verified directly (a throwaway local
+sudo user + this exact pattern) before relying on it, not just assumed
+from documentation. Password-auth mode uses the same password for SSH
+login and sudo (matching the `ansible_ssh_pass == ansible_become_pass`
+convention Installation already established); publickey mode assumes
+NOPASSWD sudo is configured (same assumption ansible's own `become` makes
+when no become password is given) and skips the password-piping
+entirely.
+
+**Config UI has two layers, and only one of them is authoritative**:
+curated fields (routing mode, tunnel protocol, kube-proxy replacement +
+API server host/port, IPAM mode, Hubble/Hubble Relay/Hubble UI,
+encryption, cluster name/ID) feed a "Generate values.yaml from fields"
+button - but the actual `values.yaml` **textarea** is what gets sent to
+the install endpoint, not the fields directly. Generating only happens on
+click (with a confirm if the textarea already has content), so hand edits
+are never silently overwritten by the fields. This mirrors how Offline
+Install's command preview mirrors its builder logic in JS while the
+backend stays authoritative for the real value.
+
+**Values.yaml content travels as a heredoc inside the remote script**, not
+as an ansible extra-var - a nested `cat > /tmp/cilium-values.yaml
+<<'CILIUM_VALUES_YAML_EOF' ... CILIUM_VALUES_YAML_EOF` inside the outer
+`CILIUM_REMOTE_SCRIPT_EOF`-delimited heredoc. Both delimiters are quoted,
+so the local shell treats everything between them as pure literal text -
+safe even though the values.yaml content could itself contain `$`,
+backticks, or quotes.
+
+**Helm/cilium CLI are installed on-demand, on the control-plane host
+itself** (not the `webui` container) - the remote script's preamble checks
+`command -v helm`/`command -v cilium` first and only downloads
+(`get.helm.sh`/`github.com/cilium/cilium-cli/releases`) if missing, so
+repeat runs skip straight past this. Pinned versions
+(`HELM_VERSION_DEFAULT`/`CILIUM_CLI_VERSION_DEFAULT` in `cilium.py`) - bump
+these if a real run needs a newer one.
+
+**Server-side confirmation gate on install** (not just a JS `confirm()`),
+same reasoning as Installation's own cluster.yml gate - Cilium install/
+upgrade changes real cluster networking, existing pods can briefly lose
+connectivity while `cilium-agent` restarts cluster-wide.
+
+**Per-node status** parses `kubectl get pods -n kube-system -l
+k8s-app=cilium -o json` directly (node name from `spec.nodeName`, ready
+state from `containerStatuses[].ready`, version parsed out of the
+container image tag) rather than needing any Cilium-specific API - simple
+and robust, no extra CRD/client library needed.
+
+### Verification status (2026-07-12)
+
+Verified without live hosts (the real cluster's 6 hosts are currently
+unreachable - see above):
+- `app.js` parses cleanly under a real Node.js engine (`node --check`),
+  not just a manual brace-balance check.
+- All 5 endpoints' validation gates: install without `confirm` (400),
+  install without a version (400), password auth without a password
+  (400), a shell-injection attempt in `ssh_user` (400, blocked by
+  `SSH_USER_RE`), an unknown inventory (404).
+- An inventory with no `kube_control_plane` hosts (`sample`) fails cleanly
+  with a 400 (`CiliumError` → `HTTPException`), not a crash.
+- Host resolution via `ansible-inventory --list` correctly found
+  `afshin`'s `master1` (`192.168.120.160`, user `soroush`, port 22) - the
+  actual SSH attempt then correctly timed out (504) rather than hanging
+  or crashing, since the host is unreachable right now.
+- The `sudo -S` + piped-password-then-script pattern verified directly
+  against a real local sudo user (not just reasoned about) - see "why"
+  section above.
+- `buildCiliumValuesYaml()`'s output validated as real YAML (via Node +
+  Python `yaml.safe_load`) for both the default field values and the
+  native-routing/kube-proxy-replacement/encryption-enabled combination.
+
+**Not yet verified**: an actual real `helm upgrade --install`/`cilium
+connectivity test` run, and the per-node status table against a real
+`kubectl get pods` response.
+
+### Update (hosts back online) — 2 real bugs found and fixed
+
+- **`/cilium/versions` timed out at 60s on first use.** The remote
+  preamble installs Helm + the cilium CLI the first time they're missing
+  (a real download over this host's connection) - that alone can take
+  longer than 60s. Confirmed directly: the call timed out, but a manual
+  re-run right after found both binaries already present on the host - the
+  install had finished, the API just gave up waiting too early. Fixed by
+  raising this endpoint's timeout to 180s (only matters on the very first
+  call per host; every call after that is fast since the preamble's
+  `command -v helm`/`command -v cilium` checks skip the download).
+- **`/cilium/versions` failed to parse real `helm search` output** - this
+  is the one the user actually hit and reported ("I don't see the version
+  kubespray has"). `json.loads(raw[raw.index("["):])` used `index()` (first
+  occurrence) to find where the JSON starts, but the sudo password prompt
+  itself (`"[sudo] password for soroush:"`, part of the same captured
+  stdout+stderr stream) contains a literal `[` that comes *before* the real
+  JSON - so it sliced from the wrong place and truncated/mangled the
+  payload. Since `helm search --versions -o json` always returns one flat
+  array (exactly one top-level `[`), the fix was simply using `rindex()`
+  (last occurrence) instead - reliable here because there's only one real
+  `[` to find. `node-status`'s equivalent `raw.index("{")` does NOT have
+  this bug (the sudo prompt has no `{` in it, and `kubectl get pods -o
+  json`'s object nesting means `rindex` would actually be wrong there - the
+  *first* `{` genuinely is the real top-level start) - left as `index()`,
+  deliberately not "fixed" the same way.
+- Confirmed working end-to-end after both fixes: `/cilium/versions`
+  against the real `afshin` cluster returned 234 real chart versions,
+  correctly including `1.19.3` - which matches kubespray's own pinned
+  `cilium_version` for the currently checked-out tag
+  (`roles/kubespray_defaults/defaults/main/download.yml` in the kubespray
+  checkout) - confirming the version list genuinely reflects what's really
+  published, not a stale/hardcoded set.
+
+### Uninstall (complete removal) — added per explicit request
+
+A plain `helm uninstall` alone routinely leaves Cilium's own CRD instances
+(`CiliumEndpoint`, `CiliumIdentity`, etc.) stuck in `Terminating` forever -
+they carry finalizers that only `cilium-agent` itself normally clears as
+part of a graceful teardown, and by the time Helm has removed the
+DaemonSet there's no agent left running to do that. The user explicitly
+asked for a real fix for this ("چیزی مثلا در finalizer‌ها هم نمونه" -
+nothing should be left in finalizers either).
+
+`cil.uninstall_command()`: `helm uninstall` first (best-effort, `|| true`
+so a partial/already-gone release doesn't abort the rest), then
+**dynamically discovers every Cilium CRD actually registered in the
+cluster** (`kubectl get crd -o name | grep -i '\.cilium\.io'`) rather than
+assuming a fixed list of kinds - deliberate, since Cilium adds/renames
+CRDs across versions and a hardcoded list would silently miss new ones.
+For each discovered CRD: clears finalizers on every instance
+(`kubectl patch ... -p '{"metadata":{"finalizers":null}}'`), deletes the
+instances, then deletes the CRD itself. Finishes by cleaning up
+cluster-scoped RBAC objects and the config/secrets Helm's own
+`resource-policy: keep` convention might have left behind
+(`cilium-config`, `cilium-ca`, the Hubble cert secrets).
+
+**Shares `CILIUM_INSTALL_LOCKS` with install** (not a separate lock) -
+they're mutually exclusive actions on the same Helm release, and letting
+one start while the other runs would race on it. Since one lock now
+serves two actions, `CILIUM_ACTIVE_ACTION[inv]` tracks which of the two is
+the current holder, so `/cilium/plan` can expose distinct
+`install_running`/`uninstall_running` booleans for the frontend to show
+the right button's "running elsewhere" state - own log dict
+(`CILIUM_UNINSTALL_LOGS`) either way.
+
+**Frontend has a two-step confirmation**, more emphatic than install's:
+a `confirm()` dialog explaining exactly what happens, then a
+`prompt()` requiring the user to type the inventory name back - matching
+how genuinely hard-to-reverse actions elsewhere in this codebase (e.g.
+deleting an inventory in the Files tab) are gated beyond a single
+dialog box.
+
+Verified: both validation gates (missing `confirm` → 400, password auth
+without a password → 400) and the `/cilium/plan` response shape
+(`install_running`/`uninstall_running`/`connectivity_running` as three
+independent booleans). **Not yet run for real** - `afshin` doesn't have
+Cilium installed yet, so there's nothing to uninstall there currently;
+deliberately not triggered as a test since it's a genuinely destructive
+action.
