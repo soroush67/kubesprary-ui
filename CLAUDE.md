@@ -49,6 +49,16 @@ unchanged in shape from the old horizontal version.
    block it). Local branch for a checked-out tag is named
    `kubespray-version/<tag>` internally (avoids git ref-name ambiguity with
    the tag of the same name) but displayed to the user as the bare tag name.
+   **Fixed real bug**: opening this tab used to run `git fetch --tags
+   --depth=1 origin` immediately and automatically (`switchTab` →
+   `loadKubespray()` → the versions endpoint) — a real network call the
+   user never asked for, just from clicking the nav button. Added
+   `GET /api/kubespray/current` (cheap, local-only: `_current_ref()` +
+   `_has_tracked_changes()`, no network) for what the tab shows on open now;
+   the actual `git fetch` + tag list only runs when the user clicks the new
+   "Fetch versions from origin" button (`fetchKubesprayVersions()` in
+   `app.js`), same as the pre-existing "Refresh versions" button once a list
+   is already showing.
 4. **Offline Install** — prepares an air-gapped install of the currently
    checked-out kubespray version, and closes the loop by writing the
    resulting repo addresses into the inventory's `offline.yml`. Started as a

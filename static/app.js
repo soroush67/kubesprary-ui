@@ -838,6 +838,53 @@ function renderOpsFields(body) {
 // ---------- Kubespray Version (git tag switcher) ----------
 
 async function loadKubespray() {
+  content.innerHTML = `<div class="empty-state"><p>Loading…</p></div>`;
+  try {
+    const data = await api("/api/kubespray/current");
+    renderKubesprayIdle(data);
+  } catch (e) {
+    content.innerHTML = "";
+    showToast("Error: " + e.message, "error");
+  }
+}
+
+function renderKubesprayIdle(data) {
+  const wrap = document.createElement("div");
+
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2>Kubespray Version</h2><span class="path">origin tags</span>`;
+  wrap.appendChild(header);
+
+  const desc = document.createElement("div");
+  desc.className = "file-desc";
+  desc.textContent = "Fetches the 10 newest release tags (e.g. v2.31.0) from origin and lets you check one out into the kubespray checkout this webui runs against.";
+  wrap.appendChild(desc);
+
+  const current = document.createElement("div");
+  current.className = "ops-note";
+  current.innerHTML = `Current: <strong>${data.current}</strong>`;
+  wrap.appendChild(current);
+
+  if (data.dirty) {
+    const dirtyNote = document.createElement("div");
+    dirtyNote.className = "ops-note danger";
+    dirtyNote.textContent = "The kubespray checkout has uncommitted changes. Switching versions is blocked until you commit or discard them (this protects any group_vars edits made from the Files tab).";
+    wrap.appendChild(dirtyNote);
+  }
+
+  const toolbar = document.createElement("div");
+  toolbar.className = "toolbar";
+  toolbar.innerHTML = `<button id="fetchVersionsBtn" class="btn-primary">Fetch versions from origin</button>`;
+  wrap.appendChild(toolbar);
+
+  content.innerHTML = "";
+  content.appendChild(wrap);
+
+  el("#fetchVersionsBtn").addEventListener("click", fetchKubesprayVersions);
+}
+
+async function fetchKubesprayVersions() {
   content.innerHTML = `<div class="empty-state"><p>Fetching versions from origin…</p></div>`;
   try {
     const data = await api("/api/kubespray/versions");
@@ -901,7 +948,7 @@ function renderKubespray(data) {
   content.innerHTML = "";
   content.appendChild(wrap);
 
-  el("#refreshBranchesBtn").addEventListener("click", loadKubespray);
+  el("#refreshBranchesBtn").addEventListener("click", fetchKubesprayVersions);
 }
 
 async function checkoutKubesprayVersion(version) {
@@ -913,7 +960,7 @@ async function checkoutKubesprayVersion(version) {
       body: JSON.stringify({ version }),
     });
     showToast(`Checked out "${version}".`, "success");
-    await loadKubespray();
+    await fetchKubesprayVersions();
   } catch (e) {
     showToast("Error: " + e.message, "error");
   }

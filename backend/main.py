@@ -352,6 +352,13 @@ def _current_ref() -> str:
     return ref.removeprefix(VERSION_BRANCH_PREFIX)
 
 
+@app.get("/api/kubespray/current")
+def get_kubespray_current():
+    """Cheap, local-only info (no network fetch) - what the tab shows before
+    the user explicitly asks to fetch versions from origin."""
+    return {"current": _current_ref(), "dirty": _has_tracked_changes()}
+
+
 @app.get("/api/kubespray/versions")
 def list_kubespray_versions():
     _run_git(["fetch", "--tags", "--depth=1", "origin"])
