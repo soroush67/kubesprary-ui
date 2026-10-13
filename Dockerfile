@@ -4,7 +4,7 @@ FROM python:3.12-slim
 # /etc/containers exists; the daemon.json it writes there is inert (the real daemon is
 # on the host, reached via the mounted socket) - this just satisfies the check.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends git ca-certificates docker-cli sudo curl wget dpkg-dev sshpass openssh-client \
+    && apt-get install -y --no-install-recommends git ca-certificates docker-cli sudo curl wget dpkg-dev sshpass openssh-client skopeo rsync \
     && rm -rf /var/lib/apt/lists/* \
     && git config --global --add safe.directory /kubespray \
     && mkdir -p /etc/docker

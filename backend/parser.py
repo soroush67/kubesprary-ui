@@ -178,6 +178,28 @@ def apply_updates(parsed: ParsedFile, updates: dict[str, dict]) -> ParsedFile:
     return parse(new_text)
 
 
+def upsert(parsed: ParsedFile, updates: dict[str, dict], header: str = "") -> ParsedFile:
+    """apply_updates(), plus: keys that don't exist in the file at all (not
+    even as a commented placeholder) are appended at the end, enabled.
+    A value containing a newline is written as a whole multi-line block
+    (its first line must be "key:"), like an existing multiline entry."""
+    updated = apply_updates(parsed, updates)
+    present = {e.key for e in updated.entries}
+    missing = [k for k in updates if k not in present]
+    if not missing:
+        return updated
+    lines = list(updated.lines)
+    while lines and lines[-1].strip() == "":
+        lines.pop()
+    lines.append("")
+    if header:
+        lines.append(f"# {header}")
+    for key in missing:
+        value = updates[key].get("value", "")
+        lines += render_entry_lines(key, updates[key].get("enabled", True), value, "\n" in value)
+    return parse("\n".join(lines) + "\n")
+
+
 def infer_type(value: str) -> str:
     v = value.strip()
     if v.lower() in ("true", "false"):

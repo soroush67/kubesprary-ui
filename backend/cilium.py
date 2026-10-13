@@ -68,17 +68,33 @@ def _ssh_prefix(host: dict, ssh_user: str | None, auth_method: str, ssh_password
 # Bash preamble shared by every remote script: installs helm/the cilium CLI
 # if missing (idempotent - skips the download entirely once present), then
 # points KUBECONFIG at the admin kubeconfig cluster.yml already put there.
+#
+# {base} is "https://" online, or "<files_repo>/" offline: the files mirror
+# keeps every download under its original host/path (`wget -x`), see
+# offline.py's cilium_assets_command().
 _REMOTE_PREAMBLE_TEMPLATE = f"""
 export KUBECONFIG={KUBECONFIG_PATH}
 if ! command -v helm >/dev/null 2>&1; then
-  curl -fsSL https://get.helm.sh/helm-v{{helm_version}}-linux-amd64.tar.gz | tar -xz -C /tmp
+  curl -fsSL {{base}}get.helm.sh/helm-v{{helm_version}}-linux-amd64.tar.gz | tar -xz -C /tmp
   install -m 0755 /tmp/linux-amd64/helm /usr/local/bin/helm
 fi
 if ! command -v cilium >/dev/null 2>&1; then
-  curl -fsSL https://github.com/cilium/cilium-cli/releases/download/v{{cilium_cli_version}}/cilium-linux-amd64.tar.gz -o /tmp/cilium-cli.tar.gz
+  curl -fsSL {{base}}github.com/cilium/cilium-cli/releases/download/v{{cilium_cli_version}}/cilium-linux-amd64.tar.gz -o /tmp/cilium-cli.tar.gz
   tar -xzf /tmp/cilium-cli.tar.gz -C /usr/local/bin
 fi
 """.strip()
+
+
+def _preamble(offline: dict | None, helm_version: str = HELM_VERSION_DEFAULT,
+              cilium_cli_version: str = CILIUM_CLI_VERSION_DEFAULT) -> str:
+    """offline = {"files_repo", "helm_version", "cli_version"} when the
+    inventory's offline.yml points at the local mirrors (isolated site)."""
+    if offline:
+        return _REMOTE_PREAMBLE_TEMPLATE.format(
+            base=offline["files_repo"].rstrip("/") + "/",
+            helm_version=offline["helm_version"], cilium_cli_version=offline["cli_version"])
+    return _REMOTE_PREAMBLE_TEMPLATE.format(
+        base="https://", helm_version=helm_version, cilium_cli_version=cilium_cli_version)
 
 
 def _wrap_remote_script(ssh_prefix: str, script: str, sudo_password: str | None) -> str:
@@ -112,9 +128,7 @@ def _sudo_password_for(auth_method: str, ssh_password: str | None) -> str | None
 
 def versions_command(host: dict, ssh_user, auth_method, ssh_password) -> str:
     prefix = _ssh_prefix(host, ssh_user, auth_method, ssh_password)
-    script = _REMOTE_PREAMBLE_TEMPLATE.format(
-        helm_version=HELM_VERSION_DEFAULT, cilium_cli_version=CILIUM_CLI_VERSION_DEFAULT
-    ) + """
+    script = _preamble(None) + """
 helm repo add cilium https://helm.cilium.io/ >/dev/null 2>&1 || true
 helm repo update cilium >/dev/null 2>&1
 helm search repo cilium/cilium --versions -o json
@@ -132,16 +146,26 @@ def install_command(
     host: dict, ssh_user, auth_method, ssh_password,
     cilium_version: str, values_yaml: str,
     helm_version: str = HELM_VERSION_DEFAULT, cilium_cli_version: str = CILIUM_CLI_VERSION_DEFAULT,
+    offline: dict | None = None,
 ) -> str:
     prefix = _ssh_prefix(host, ssh_user, auth_method, ssh_password)
-    script = _REMOTE_PREAMBLE_TEMPLATE.format(helm_version=helm_version, cilium_cli_version=cilium_cli_version) + f"""
-helm repo add cilium https://helm.cilium.io/ >/dev/null 2>&1 || true
-helm repo update cilium
+    if offline:
+        # the chart straight from the files mirror; its images come from the
+        # local registry through containerd's registry mirrors (offline.yml)
+        chart_url = f"{offline['files_repo'].rstrip('/')}/helm.cilium.io/cilium-{cilium_version}.tgz"
+        source = "true  # offline: chart from the local files mirror"
+        chart = shlex.quote(chart_url)
+        version_flag = ""
+    else:
+        source = "helm repo add cilium https://helm.cilium.io/ >/dev/null 2>&1 || true\nhelm repo update cilium"
+        chart = "cilium/cilium"
+        version_flag = f" --version {shlex.quote(cilium_version)}"
+    script = _preamble(offline, helm_version, cilium_cli_version) + f"""
+{source}
 cat > /tmp/cilium-values.yaml <<'CILIUM_VALUES_YAML_EOF'
 {values_yaml}
 CILIUM_VALUES_YAML_EOF
-helm upgrade --install cilium cilium/cilium \\
-  --version {shlex.quote(cilium_version)} \\
+helm upgrade --install cilium {chart}{version_flag} \\
   --namespace kube-system \\
   -f /tmp/cilium-values.yaml \\
   --wait --timeout 10m

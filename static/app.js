@@ -975,7 +975,7 @@ const OFFLINE_STATUS_LABEL = {
   offline_files_archive: "offline-files.tar.gz",
   container_images_archive: "container-images.tar.gz",
   pip_packages_dir: "pip-packages/",
-  helm_charts_dir: "helm-charts/",
+  cilium_charts: "Cilium charts in the files mirror",
   os_packages_dir: "os-packages/",
 };
 
@@ -985,11 +985,11 @@ const OFFLINE_STAGE_STATUS_KEY = {
   "container-images": ["container_images_archive"],
   "pip-packages": ["pip_packages_dir"],
   "os-packages": ["os_packages_dir"],
-  "helm-charts": ["helm_charts_dir"],
+  "cilium-assets": ["cilium_charts"],
 };
 
 // Stages with a real "Run" button. Backed by /api/inventories/{inv}/offline/run/{id}.
-const OFFLINE_RUNNABLE = new Set(["generate-lists", "download-files", "container-images", "os-packages", "pip-packages"]);
+const OFFLINE_RUNNABLE = new Set(["generate-lists", "download-files", "container-images", "os-packages", "pip-packages", "cilium-assets"]);
 
 if (!state.offlineForm) {
   const guessedHost = ["localhost", "127.0.0.1"].includes(location.hostname) ? "" : location.hostname;
@@ -1086,8 +1086,11 @@ const OFFLINE_LOCAL_PIP_PORT = 8082;
 // truthful while the user edits the registry fields (the real run always goes
 // through the backend builder - this is display-only). "local" targets the
 // always-on offline-registry compose service, already running - nothing to start.
-function buildContainerImagesCommand(offlineDir) {
+function buildContainerImagesCommand(offlineDir, stageCommand) {
   const f = state.offlineForm;
+  // local mode: offline.py's command (create + register + the skopeo fill-in
+  // for whatever register couldn't push) is the source of truth
+  if (f.registryMode !== "remote" && stageCommand) return stageCommand;
   const dest = (f.registryMode === "remote" && f.registryAddress) ? f.registryAddress : `localhost:${OFFLINE_LOCAL_REGISTRY_PORT}`;
   // same stale-list guard as offline.py's container_images_command()
   const guard = `if head -1 ${offlineDir}/temp/images.list | cut -d/ -f1 | grep -q ':'; then ` +
@@ -1101,13 +1104,10 @@ function buildContainerImagesCommand(offlineDir) {
 // path (used for mkdir, run inside this container); hostOfflineDir is the real
 // host path (needed for the throwaway ubuntu container's `docker run -v`, since
 // that's resolved by the HOST daemon via the mounted socket) - see offline.py.
-function buildOsPackagesCommand(offlineDir, hostOfflineDir, packages) {
-  const f = state.offlineForm;
-  const outdir = `${offlineDir}/os-packages`;
-  const hostOutdir = `${hostOfflineDir}/os-packages`;
-  return `mkdir -p ${outdir} && docker run --rm -v ${hostOutdir}:/var/cache/apt/archives ` +
-    `ubuntu:${f.ubuntuRelease} bash -c "apt-get update -q && apt-get install --download-only -y ${packages.join(" ")}" && ` +
-    `cd ${outdir} && dpkg-scanpackages . /dev/null 2>/dev/null | gzip -9c > Packages.gz`;
+function buildOsPackagesCommand(baseCommand) {
+  // offline.py's os_packages_command() is the source of truth (its download
+  // script is long and quoted); only the Ubuntu release differs here.
+  return baseCommand.replace(/ubuntu:\S+ bash -c/, `ubuntu:${state.offlineForm.ubuntuRelease} bash -c`);
 }
 
 // Silent background check while a stage is running (server-side, per
@@ -1150,7 +1150,7 @@ function renderOfflineConfigureCard() {
 
   const note = document.createElement("div");
   note.className = "ops-note";
-  note.textContent = "Writes registry_host/files_repo/ubuntu_repo/debian_repo into this inventory's offline.yml. Use the address your CLUSTER NODES will reach this host at - not localhost, which only makes sense for the push step above (that runs locally via the Docker socket).";
+  note.textContent = "Writes registry_host/files_repo/ubuntu_repo/debian_repo, the image repos, every *_download_url (kubeadm, kubelet, containerd, ... from the files mirror) and containerd registry mirrors into this inventory's offline.yml - everything the nodes need to install with no internet. Use the address your CLUSTER NODES will reach this host at - not localhost. After moving this machine to another network, just enter the new address here and write again.";
   note.style.marginBottom = "10px";
   card.appendChild(note);
 
@@ -1169,14 +1169,25 @@ function renderOfflineConfigureCard() {
   preview.style.marginTop = "10px";
   preview.style.minHeight = "110px";
 
+  // mirrors offline.py's offline_yml_updates() / containerd_mirrors_block()
   function refreshPreview() {
     const h = state.offlineForm.hostAddress;
-    preview.value = h
-      ? `registry_host: "${h}:${OFFLINE_LOCAL_REGISTRY_PORT}"\n` +
-        `files_repo: "http://${h}:${OFFLINE_LOCAL_NGINX_PORT}"\n` +
-        `ubuntu_repo: "http://${h}:${OFFLINE_LOCAL_APT_PORT}"\n` +
-        `debian_repo: "http://${h}:${OFFLINE_LOCAL_APT_PORT}"`
-      : "Enter a host address above to preview the values.";
+    if (!h) {
+      preview.value = "Enter a host address above to preview the values.";
+      return;
+    }
+    const reg = `${h}:${OFFLINE_LOCAL_REGISTRY_PORT}`;
+    const mirrors = [reg, "docker.io", "quay.io", "registry.k8s.io", "ghcr.io", "gcr.io"]
+      .map((p) => `  - prefix: "${p}"\n    mirrors:\n      - host: "http://${reg}"\n        capabilities: ["pull", "resolve"]`)
+      .join("\n");
+    preview.value =
+      `registry_host: "${reg}"\n` +
+      `files_repo: "http://${h}:${OFFLINE_LOCAL_NGINX_PORT}"\n` +
+      `ubuntu_repo: "http://${h}:${OFFLINE_LOCAL_APT_PORT}"\n` +
+      `debian_repo: "http://${h}:${OFFLINE_LOCAL_APT_PORT}"\n` +
+      `kube/gcr/github/docker/quay_image_repo: "{{ registry_host }}"\n` +
+      `*_download_url: every placeholder enabled -> "{{ files_repo }}/<original host>/<path>"\n` +
+      `containerd_registries_mirrors:\n${mirrors}`;
   }
   hostInput.addEventListener("input", () => {
     state.offlineForm.hostAddress = hostInput.value;
@@ -1198,7 +1209,7 @@ function renderOfflineConfigureCard() {
       showToast("Enter a host address first.", "error");
       return;
     }
-    if (!confirm(`Write registry_host/files_repo/ubuntu_repo/debian_repo into inventory/${state.inventory}/group_vars/all/offline.yml, pointing at "${host}"?`)) return;
+    if (!confirm(`Write the offline settings (repos, download URLs, containerd mirrors) into inventory/${state.inventory}/group_vars/all/offline.yml, pointing at "${host}"?`)) return;
     try {
       await api(`/api/inventories/${state.inventory}/offline/configure`, {
         method: "POST",
@@ -1212,6 +1223,175 @@ function renderOfflineConfigureCard() {
   });
   card.appendChild(writeBtn);
 
+  return card;
+}
+
+// "Ready for an isolated site?" - read-only, checks what is REALLY in the
+// local mirrors (registry tags, files on disk, apt index, offline.yml,
+// compose images) - offline.py readiness(). Run it before shutting the
+// machine down to move it.
+function renderOfflineReadinessCard() {
+  const card = document.createElement("div");
+  card.className = "host-card";
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2 style="font-size:15px">Ready for an isolated site?</h2>`;
+  card.appendChild(header);
+  const note = document.createElement("div");
+  note.className = "ops-note";
+  note.textContent = "Checks that everything an install without internet needs is really in this machine's mirrors - every image in the registry, every file, the apt index, the Cilium chart, offline.yml and the docker-compose images. Read-only.";
+  card.appendChild(note);
+  const btn = document.createElement("button");
+  btn.className = "btn-secondary";
+  btn.style.marginTop = "10px";
+  btn.textContent = "🔍 Check readiness";
+  const result = document.createElement("div");
+  result.style.marginTop = "10px";
+  btn.addEventListener("click", async () => {
+    btn.disabled = true;
+    btn.textContent = "Checking…";
+    try {
+      const data = await api(`/api/inventories/${state.inventory}/offline/readiness`);
+      const rows = data.checks.map((c) =>
+        `<tr><td>${c.ok ? "✅" : "❌"}</td><td>${escapeHtml(c.name)}</td><td>${escapeHtml(c.detail)}</td></tr>`).join("");
+      result.innerHTML = `<div class="ops-note ${data.ready ? "" : "danger"}">${data.ready
+        ? "Ready: everything an isolated install needs is in the local mirrors."
+        : "Not ready yet - see the ❌ rows."}</div><table class="data-table">${rows}</table>`;
+    } catch (e) {
+      showToast("Error: " + e.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🔍 Check readiness";
+    }
+  });
+  card.appendChild(btn);
+  card.appendChild(result);
+  return card;
+}
+
+// "Move to another server" - runs scripts/transfer.sh (same script as from a
+// terminal): app + kubespray with every offline download + images + registry
+// volume -> another server, then docker compose up there. Docker must already
+// be installed on the target (the script checks, never installs).
+function renderTransferCard(transfer) {
+  if (!state.transferForm) {
+    state.transferForm = { host: "", port: "22", user: "", password: "", dest: "", withBackups: false, start: true };
+  }
+  const f = state.transferForm;
+  const card = document.createElement("div");
+  card.className = "host-card";
+  const header = document.createElement("div");
+  header.className = "file-header";
+  header.innerHTML = `<h2 style="font-size:15px">Move everything to another server</h2>`;
+  card.appendChild(header);
+  const note = document.createElement("div");
+  note.className = "ops-note";
+  note.textContent = "Copies this webui, the kubespray checkout with every offline download, the stack's docker images and the offline registry's data to another server, then runs docker compose up there - it then serves everything with no internet. The target needs Docker + compose installed and usable by that user (docker group); this does not install Docker. Safe to re-run: whatever already arrived is skipped. Terminal equivalent: scripts/transfer.sh --help";
+  card.appendChild(note);
+
+  const form = document.createElement("div");
+  form.className = "ops-fields";
+  form.style.marginTop = "10px";
+  const field = (key, label, type = "text", placeholder = "") => {
+    const input = document.createElement("input");
+    input.type = type;
+    input.placeholder = placeholder;
+    input.value = f[key];
+    input.addEventListener("input", () => { f[key] = input.value.trim(); });
+    form.appendChild(opsField(label, input));
+  };
+  const check = (key, label) => {
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = f[key];
+    input.addEventListener("change", () => { f[key] = input.checked; });
+    form.appendChild(opsField(label, input));
+  };
+  field("host", "Server address", "text", "e.g. 192.168.12.22");
+  field("port", "SSH port", "text", "22");
+  field("user", "SSH user", "text", "e.g. devops");
+  field("password", "SSH password (empty = this webui's SSH key)", "password");
+  field("dest", "Destination directory", "text", "e.g. /home/devops/kube-offline");
+  check("withBackups", "Also copy the RustFS etcd-backup volumes");
+  check("start", "Start the stack there afterwards (docker compose up -d)");
+  card.appendChild(form);
+
+  const row = document.createElement("div");
+  row.style.display = "flex";
+  row.style.gap = "8px";
+  row.style.marginTop = "10px";
+  const checkBtn = document.createElement("button");
+  checkBtn.className = "btn-secondary";
+  checkBtn.textContent = "🔍 Check only";
+  const goBtn = document.createElement("button");
+  goBtn.className = "btn-danger";
+  goBtn.textContent = "🚚 Transfer";
+  if (transfer.running) {
+    checkBtn.disabled = goBtn.disabled = true;
+    goBtn.textContent = "Transferring… (started elsewhere)";
+  }
+  row.appendChild(checkBtn);
+  row.appendChild(goBtn);
+  card.appendChild(row);
+
+  const logEl = document.createElement("pre");
+  logEl.className = "raw-editor ops-cmd-output offline-log";
+  const prior = transfer.log || state.transferLog || "";
+  state.transferLog = prior;
+  logEl.textContent = prior;
+  logEl.style.display = prior ? "block" : "none";
+  logEl.style.marginTop = "10px";
+  card.appendChild(logEl);
+
+  async function run(checkOnly) {
+    if (!f.host || !f.user || !f.dest) {
+      showToast("Server address, user and destination are required.", "error");
+      return;
+    }
+    if (!checkOnly && !confirm(`Copy everything (about 10 GB) to ${f.user}@${f.host}:${f.dest}` +
+        `${f.start ? " and start the stack there" : ""}?`)) return;
+    checkBtn.disabled = goBtn.disabled = true;
+    const btn = checkOnly ? checkBtn : goBtn;
+    const orig = btn.textContent;
+    btn.textContent = checkOnly ? "Checking…" : "Transferring…";
+    logEl.style.display = "block";
+    logEl.textContent = "";
+    state.transferLog = "";
+    try {
+      const res = await fetch("/api/transfer/run", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          host: f.host, port: parseInt(f.port || "22", 10), user: f.user, password: f.password || null,
+          dest: f.dest, with_backups: f.withBackups, start: f.start, check_only: checkOnly, confirm: !checkOnly,
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.detail || res.statusText);
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const chunk = decoder.decode(value, { stream: true });
+        logEl.textContent += chunk;
+        state.transferLog += chunk;
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+      const code = parseExitCode(state.transferLog);
+      showToast(code === 0 ? (checkOnly ? "All checks passed - ready to transfer." : "Transferred and started.")
+        : `Stopped (exit code ${code}) - see the log.`, code === 0 ? "success" : "error");
+    } catch (e) {
+      showToast("Error: " + e.message, "error");
+    } finally {
+      checkBtn.disabled = goBtn.disabled = false;
+      btn.textContent = orig;
+    }
+  }
+  checkBtn.addEventListener("click", () => run(true));
+  goBtn.addEventListener("click", () => run(false));
   return card;
 }
 
@@ -1240,6 +1420,9 @@ function renderOffline(data) {
     `kube_network_plugin: <strong>${data.config.kube_network_plugin}</strong> &nbsp;·&nbsp; ` +
     `helm_enabled: <strong>${data.config.helm_enabled}</strong>`;
   wrap.appendChild(summary);
+
+  wrap.appendChild(renderOfflineReadinessCard());
+  wrap.appendChild(renderTransferCard(data.transfer || {}));
 
   for (const stage of data.stages) {
     const card = document.createElement("div");
@@ -1297,7 +1480,7 @@ function renderOffline(data) {
         addressInput.value = state.offlineForm.registryAddress;
         addressInput.disabled = state.offlineForm.registryMode !== "remote";
 
-        const refresh = () => { output.value = buildContainerImagesCommand(data.offline_dir); };
+        const refresh = () => { output.value = buildContainerImagesCommand(data.offline_dir, stage.command); };
         localRadio.addEventListener("change", () => { state.offlineForm.registryMode = "local"; addressInput.disabled = true; refresh(); });
         remoteRadio.addEventListener("change", () => { state.offlineForm.registryMode = "remote"; addressInput.disabled = false; refresh(); });
         addressInput.addEventListener("input", () => { state.offlineForm.registryAddress = addressInput.value; refresh(); });
@@ -1319,9 +1502,28 @@ function renderOffline(data) {
         releaseInput.value = state.offlineForm.ubuntuRelease;
         releaseInput.addEventListener("input", () => {
           state.offlineForm.ubuntuRelease = releaseInput.value;
-          output.value = buildOsPackagesCommand(data.offline_dir, data.host_offline_dir, stage.packages);
+          output.value = buildOsPackagesCommand(stage.command);
         });
         form.appendChild(opsField("Ubuntu release (target nodes)", releaseInput));
+        card.appendChild(form);
+      }
+
+      if (stage.id === "cilium-assets") {
+        if (!state.offlineForm.ciliumVersion) state.offlineForm.ciliumVersion = stage.version;
+        const form = document.createElement("div");
+        form.className = "ops-fields";
+        form.style.marginTop = "12px";
+        form.style.marginBottom = "0";
+        const versionInput = document.createElement("input");
+        versionInput.type = "text";
+        versionInput.value = state.offlineForm.ciliumVersion;
+        // offline.py's cilium_assets_command() is the source of truth; only the version differs
+        const refreshCilium = () => {
+          output.value = stage.command.replace(/CILIUM_VERSION=[^\n]+/, `CILIUM_VERSION=${state.offlineForm.ciliumVersion}`);
+        };
+        versionInput.addEventListener("input", () => { state.offlineForm.ciliumVersion = versionInput.value.trim(); refreshCilium(); });
+        refreshCilium();
+        form.appendChild(opsField("Cilium chart version (default: kubespray's cilium_version)", versionInput));
         card.appendChild(form);
       }
 
@@ -1367,6 +1569,8 @@ function renderOffline(data) {
             body = { registry_mode: state.offlineForm.registryMode, registry_address: state.offlineForm.registryAddress };
           } else if (stage.id === "os-packages") {
             body = { ubuntu_release: state.offlineForm.ubuntuRelease };
+          } else if (stage.id === "cilium-assets") {
+            body = { cilium_version: state.offlineForm.ciliumVersion };
           }
           runOfflineStage(stage.id, body, logEl, runBtn);
         });
@@ -1376,44 +1580,6 @@ function renderOffline(data) {
         card.appendChild(logEl);
       }
 
-      if (stage.id === "helm-charts") {
-        const form = document.createElement("div");
-        form.className = "ops-fields";
-        form.style.marginTop = "12px";
-        form.style.marginBottom = "0";
-
-        const repoName = document.createElement("input");
-        repoName.type = "text";
-        repoName.placeholder = "e.g. ingress-nginx";
-        const repoUrl = document.createElement("input");
-        repoUrl.type = "text";
-        repoUrl.placeholder = "e.g. https://kubernetes.github.io/ingress-nginx";
-        const chartName = document.createElement("input");
-        chartName.type = "text";
-        chartName.placeholder = "e.g. ingress-nginx/ingress-nginx";
-        const chartVersion = document.createElement("input");
-        chartVersion.type = "text";
-        chartVersion.placeholder = "e.g. 4.13.3";
-
-        form.appendChild(opsField("Repo name", repoName));
-        form.appendChild(opsField("Repo URL", repoUrl));
-        form.appendChild(opsField("Chart name", chartName));
-        form.appendChild(opsField("Chart version", chartVersion));
-
-        const addBtn = document.createElement("button");
-        addBtn.className = "btn-secondary";
-        addBtn.textContent = "Add another chart to the command above";
-        addBtn.addEventListener("click", () => {
-          if (!repoName.value || !repoUrl.value || !chartName.value || !chartVersion.value) {
-            showToast("Fill in all four fields first.", "error");
-            return;
-          }
-          output.value += `\n\nhelm repo add ${repoName.value} ${repoUrl.value} && helm repo update && ` +
-            `helm pull ${chartName.value} --version ${chartVersion.value} --destination ${output.value.match(/--destination (\S+)/)?.[1] || "./helm-charts"}`;
-        });
-        form.appendChild(addBtn);
-        card.appendChild(form);
-      }
     }
 
     wrap.appendChild(card);
@@ -1634,14 +1800,15 @@ async function pollInstallationRunning(previousSnapshot) {
       running: freshData.running, log: freshData.log,
       connectivity_running: freshData.connectivity_running, connectivity_log: freshData.connectivity_log,
       verify_running: freshData.verify_running, verify_log: freshData.verify_log,
+      offline_apt_running: freshData.offline_apt_running, offline_apt_log: freshData.offline_apt_log,
     };
     const changed = JSON.stringify(snapshot) !== JSON.stringify(previousSnapshot);
     if (changed) {
       preserveScroll(
-        ["installationConnectivityLog", "installationInstallLog", "installationVerifyLog"],
+        ["installationConnectivityLog", "installationOfflineAptLog", "installationInstallLog", "installationVerifyLog"],
         () => renderInstallation(freshData)
       );
-    } else if (freshData.running || freshData.connectivity_running || freshData.verify_running) {
+    } else if (freshData.running || freshData.connectivity_running || freshData.verify_running || freshData.offline_apt_running) {
       setTimeout(() => pollInstallationRunning(snapshot), 4000);
     }
   } catch (e) {
@@ -1741,6 +1908,59 @@ async function runVerifyCluster(logEl, btn) {
     showToast("Error: " + e.message, "error");
   } finally {
     btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function runOfflineApt(mode, logEl, btn, otherBtn) {
+  const f = state.installationForm;
+  if (f.authMethod === "password" && !f.sshPassword) {
+    showToast("Enter a password, or switch to Public key auth.", "error");
+    return;
+  }
+  const what = mode === "enable"
+    ? "point apt on EVERY node at this host's offline repo (their own sources are moved to /etc/apt/offline-backup/)"
+    : "move every node's original apt sources back and remove the offline repo entry";
+  if (!confirm(`Really ${what}, for inventory "${state.inventory}"?`)) return;
+  const origText = btn.textContent;
+  btn.disabled = otherBtn.disabled = true;
+  btn.textContent = "Running…";
+  logEl.style.display = "block";
+  logEl.textContent = "";
+  state.offlineAptLog = "";
+  try {
+    const res = await fetch(`/api/inventories/${state.inventory}/installation/offline-apt`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        confirm: true, mode,
+        ssh_user: f.sshUser || null,
+        auth_method: f.authMethod,
+        ssh_password: f.authMethod === "password" ? f.sshPassword : null,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || res.statusText);
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = decoder.decode(value, { stream: true });
+      logEl.textContent += chunk;
+      state.offlineAptLog += chunk;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    const code = parseExitCode(state.offlineAptLog);
+    showToast(code === 0
+      ? (mode === "enable" ? "Nodes now use the offline apt repo." : "Node apt sources restored.")
+      : `Failed (exit code ${code}) - see the log.`, code === 0 ? "success" : "error");
+  } catch (e) {
+    showToast("Error: " + e.message, "error");
+  } finally {
+    btn.disabled = otherBtn.disabled = false;
     btn.textContent = origText;
   }
 }
@@ -1894,6 +2114,44 @@ function renderInstallation(data) {
   wrap.appendChild(checkRow);
   wrap.appendChild(checkLogEl);
 
+  // Isolated site: point every node's apt at the offline-apt repo (:8081)
+  // before installing - kubespray installs conntrack/socat/... via the nodes'
+  // own apt sources (playbooks/offline-apt.yml).
+  const aptDesc = document.createElement("div");
+  aptDesc.className = "file-desc";
+  aptDesc.textContent = "No internet on the nodes? Before installing, point their apt at this host's offline repo (ubuntu_repo from offline.yml). The nodes' own sources are moved to /etc/apt/offline-backup/ - \"Restore\" puts them back.";
+  aptDesc.style.marginTop = "6px";
+  wrap.appendChild(aptDesc);
+
+  const aptRow = document.createElement("div");
+  aptRow.style.display = "flex";
+  aptRow.style.gap = "8px";
+  const aptBtn = document.createElement("button");
+  aptBtn.className = "btn-secondary";
+  aptBtn.textContent = "📦 Point node apt at offline repo";
+  const aptRestoreBtn = document.createElement("button");
+  aptRestoreBtn.className = "btn-secondary";
+  aptRestoreBtn.textContent = "↩ Restore node apt sources";
+  if (data.offline_apt_running) {
+    aptBtn.disabled = aptRestoreBtn.disabled = true;
+    aptBtn.textContent = "Running… (started elsewhere)";
+  }
+  const aptLogEl = document.createElement("pre");
+  aptLogEl.id = "installationOfflineAptLog";
+  aptLogEl.className = "raw-editor ops-cmd-output offline-log";
+  const priorAptLog = data.offline_apt_log || state.offlineAptLog;
+  state.offlineAptLog = priorAptLog || "";
+  aptLogEl.textContent = priorAptLog || "";
+  aptLogEl.style.display = priorAptLog ? "block" : "none";
+  aptLogEl.style.marginTop = "10px";
+  aptLogEl.style.marginBottom = "10px";
+  aptBtn.addEventListener("click", () => runOfflineApt("enable", aptLogEl, aptBtn, aptRestoreBtn));
+  aptRestoreBtn.addEventListener("click", () => runOfflineApt("restore", aptLogEl, aptRestoreBtn, aptBtn));
+  aptRow.appendChild(aptBtn);
+  aptRow.appendChild(aptRestoreBtn);
+  wrap.appendChild(aptRow);
+  wrap.appendChild(aptLogEl);
+
   wrap.appendChild(cmdBox);
 
   const runRow = document.createElement("div");
@@ -1957,11 +2215,12 @@ function renderInstallation(data) {
   content.innerHTML = "";
   content.appendChild(wrap);
 
-  if (data.running || data.connectivity_running || data.verify_running) {
+  if (data.running || data.connectivity_running || data.verify_running || data.offline_apt_running) {
     setTimeout(() => pollInstallationRunning({
       running: data.running, log: data.log,
       connectivity_running: data.connectivity_running, connectivity_log: data.connectivity_log,
       verify_running: data.verify_running, verify_log: data.verify_log,
+      offline_apt_running: data.offline_apt_running, offline_apt_log: data.offline_apt_log,
     }), 4000);
   }
 }
@@ -2110,7 +2369,9 @@ async function refreshCiliumVersions(selectEl, btn) {
       state.ciliumForm.version = data.versions[0];
       selectEl.value = data.versions[0];
     }
-    showToast(`Loaded ${data.versions.length} version(s).`, "success");
+    showToast(data.offline
+      ? `Offline mode: ${data.versions.length} version(s) in the local files mirror.`
+      : `Loaded ${data.versions.length} version(s).`, "success");
   } catch (e) {
     showToast("Error: " + e.message, "error");
   } finally {

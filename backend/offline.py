@@ -10,9 +10,14 @@ security trade-off that entails.
 """
 from __future__ import annotations
 
+import gzip
 import json
 import re
 import shlex
+import subprocess
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import parser as gv
@@ -24,10 +29,17 @@ DEFAULT_CONFIG = {
     "cilium_version": None,
 }
 
+# Everything kubespray's roles/system_packages installs on Ubuntu nodes
+# (vars/main.yml, Debian-family entries) plus a few tools the webui's own
+# playbooks use. Most are already on Ubuntu Server, but "already installed"
+# isn't guaranteed on every node image, and in an isolated site apt has no
+# other source than this repo.
 BASE_OS_PACKAGES = [
-    "conntrack", "ipset", "ipvsadm", "socat", "ebtables", "ethtool",
-    "curl", "rsync", "tar", "unzip",
-    "apt-transport-https", "ca-certificates", "software-properties-common",
+    "apparmor", "apt-transport-https", "bash-completion", "ca-certificates", "chrony",
+    "conntrack", "curl", "e2fsprogs", "ebtables", "ethtool", "iproute2", "iptables",
+    "iputils-ping", "ipset", "ipvsadm", "libseccomp2", "nftables", "openssl",
+    "python3-apt", "rsync", "socat", "software-properties-common", "tar", "unzip",
+    "xfsprogs",
 ]
 
 
@@ -91,7 +103,8 @@ def artifact_status(kubespray_root: Path) -> dict:
         # `rm -rf`s that whole directory on every run, which would silently wipe
         # these out if they lived inside it.
         "pip_packages_dir": _file_info(offline_dir / "pip-packages"),
-        "helm_charts_dir": _file_info(offline_dir / "helm-charts"),
+        "cilium_charts": {"exists": bool(offline_cilium_charts(kubespray_root)),
+                          "file_count": len(offline_cilium_charts(kubespray_root))},
         "os_packages_dir": _file_info(offline_dir / "os-packages"),
     }
 
@@ -152,10 +165,42 @@ def container_images_command(kubespray_root: Path, registry_mode: str, registry_
         "run \"Generate file & image lists\" again first.'; exit 1; fi && "
     )
 
-    return (
+    base = (
         f"cd {offline_dir} && {stale_list_guard}{private_registry_env}IMAGES_FROM_FILE={offline_dir}/temp/images.list "
         f"./manage-offline-container-images.sh create && "
         f"DESTINATION_REGISTRY={dest} ./manage-offline-container-images.sh register"
+    )
+    if registry_mode == "remote":
+        return base
+    # Local registry: register() aborts the whole remaining batch on the first
+    # image `docker push` can't handle (gotcha #7 - e.g. metrics-server:v0.8.1,
+    # "was found but does not provide any platform"). So whatever is still
+    # missing afterwards is copied straight from its original source with
+    # skopeo (multi-arch, digests kept), and the stage only succeeds once
+    # every image in images.list is really in the registry.
+    fill = rf"""set -uo pipefail
+REG=offline-registry:{LOCAL_REGISTRY_PORT}
+ACCEPT='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+missing=0; filled=0
+while read -r img; do
+  [ -n "$img" ] || continue
+  name=${{img%@*}}; last=${{name##*/}}
+  if [ "${{last#*:}}" != "$last" ]; then repo=${{name%:*}}; tag=${{name##*:}}; else repo=$name; tag=latest; fi
+  path=$(echo "$repo" | sed -E 's#^(registry\.k8s\.io|gcr\.io|ghcr\.io|docker\.io|quay\.io)/##')
+  curl -fsI -H "Accept: $ACCEPT" "http://$REG/v2/$path/manifests/$tag" >/dev/null 2>&1 && continue
+  if skopeo copy --all --preserve-digests --retry-times 3 --dest-tls-verify=false "docker://$repo:$tag" "docker://$REG/$path:$tag" >/dev/null; then
+    echo "filled with skopeo: $img"; filled=$((filled+1))
+  else
+    echo "STILL MISSING: $img"; missing=$((missing+1))
+  fi
+done < {offline_dir}/temp/images.list
+total=$(grep -c . {offline_dir}/temp/images.list)
+echo "registry check: $((total - missing))/$total images present ($filled filled with skopeo)"
+[ "$missing" = 0 ]
+"""
+    return (
+        f"{{ {base} || echo '--- register stopped partway - filling the missing images with skopeo ---'; }} ; "
+        f"bash -c {shlex.quote(fill)}"
     )
 
 
@@ -209,11 +254,124 @@ def os_packages_command(kubespray_root: Path, host_kubespray_root: Path, ubuntu_
     packages = list(BASE_OS_PACKAGES)
     if config["container_manager"] == "docker":
         packages += ["docker-ce", "docker-ce-cli", "containerd.io"]
-    return (
-        f"mkdir -p {outdir} && docker run --rm -v {host_outdir}:/var/cache/apt/archives "
-        f'ubuntu:{ubuntu_release} bash -c "apt-get update -q && apt-get install --download-only -y {" ".join(packages)}" && '
-        f"cd {outdir} && dpkg-scanpackages . /dev/null 2>/dev/null | gzip -9c > Packages.gz"
+    # The FULL dependency closure, not `apt-get install --download-only`: that
+    # skips every dependency already installed in the throwaway ubuntu image
+    # (libc6, libssl3, ...), and a node with an older version of one of those
+    # then can't install anything offline. apt-cache depends --recurse lists
+    # them all; virtual packages (no candidate) are skipped. Then every
+    # requested package must really have a .deb, or the stage fails.
+    script = (
+        "set -e; apt-get update -q >/dev/null; "
+        "deps=$(apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts "
+        "--no-breaks --no-replaces --no-enhances $PKGS | grep '^[a-z0-9]' | sort -u); "
+        "cd /out; n=0; for p in $deps; do "
+        "if apt-get download -q \"$p\" >/dev/null 2>&1; then n=$((n+1)); else echo \"skipped $p (virtual, no candidate)\"; fi; "
+        "done; echo \"downloaded $n packages (requested + all dependencies)\"; "
+        "missing=0; for p in $PKGS; do ls ${p}_*.deb >/dev/null 2>&1 || { echo \"MISSING: $p\"; missing=1; }; done; "
+        "exit $missing"
     )
+    return (
+        f"mkdir -p {outdir} && docker run --rm -e PKGS='{' '.join(packages)}' -v {host_outdir}:/out "
+        f"ubuntu:{ubuntu_release} bash -c {shlex.quote(script)} && "
+        f"cd {outdir} && dpkg-scanpackages . /dev/null 2>/dev/null | gzip -9c > Packages.gz && "
+        f"echo \"Packages.gz: $(zcat Packages.gz | grep -c '^Package:') entries\""
+    )
+
+
+# Fallback versions for helm / the cilium CLI if download-files hasn't put
+# kubespray's own copies (files.list has both) into offline-files yet.
+CILIUM_HELM_FALLBACK = "3.18.4"
+CILIUM_CLI_FALLBACK = "0.18.9"
+HELM_TARBALL = "get.helm.sh/helm-v{v}-linux-amd64.tar.gz"
+CILIUM_CLI_TARBALL = "github.com/cilium/cilium-cli/releases/download/v{v}/cilium-linux-amd64.tar.gz"
+CILIUM_CHART = "helm.cilium.io/cilium-{v}.tgz"
+
+
+def _newest_version(files_dir: Path, pattern: str, regex: str) -> str | None:
+    found = []
+    for f in files_dir.glob(pattern):
+        m = re.search(regex, str(f.relative_to(files_dir)))
+        if m:
+            found.append(m.group(1))
+    found.sort(key=lambda v: [int(x) if x.isdigit() else x for x in re.split(r"[.-]", v)])
+    return found[-1] if found else None
+
+
+def cilium_tool_versions(kubespray_root: Path) -> tuple[str, str]:
+    """helm / cilium-cli versions for the offline Cilium path: the ones
+    kubespray's files.list put into offline-files, else the fallbacks."""
+    files_dir = kubespray_root / "contrib" / "offline" / "offline-files"
+    helm = _newest_version(files_dir, "get.helm.sh/helm-v*-linux-amd64.tar.gz", r"helm-v([0-9][^/]*)-linux-amd64")
+    cli = _newest_version(files_dir, "github.com/cilium/cilium-cli/releases/download/v*/cilium-linux-amd64.tar.gz",
+                          r"download/v([0-9][^/]*)/cilium-linux")
+    return helm or CILIUM_HELM_FALLBACK, cli or CILIUM_CLI_FALLBACK
+
+
+def offline_cilium_charts(kubespray_root: Path) -> list[str]:
+    """Cilium chart versions present in offline-files, newest first."""
+    d = kubespray_root / "contrib" / "offline" / "offline-files" / "helm.cilium.io"
+    versions = [m.group(1) for f in d.glob("cilium-*.tgz") if (m := re.match(r"cilium-(.+)\.tgz$", f.name))]
+    versions.sort(key=lambda v: [int(x) if x.isdigit() else x for x in re.split(r"[.-]", v)], reverse=True)
+    return versions
+
+
+def cilium_assets_command(kubespray_root: Path, cilium_version: str) -> str:
+    """Everything the Cilium tab needs with no internet, into the local mirrors:
+    helm + cilium CLI + the chart -> offline-files (:8080, same `wget -x` layout
+    as download-files), every image the chart (and `cilium connectivity test`)
+    uses -> offline-registry (:5000).
+
+    Images are copied with `skopeo copy --all --preserve-digests`: the chart
+    references them as quay.io/cilium/cilium:v1.19.3@sha256:<manifest LIST
+    digest>. A docker pull/push (what container-images does) re-pushes only
+    the one platform manifest, so that digest would not exist in the local
+    registry and every pull through the containerd mirror would fail.
+    The registry is reached as offline-registry:5000 (compose service name):
+    this runs inside the webui container, where localhost is not the registry.
+    """
+    helm_v, cli_v = cilium_tool_versions(kubespray_root)
+    files_dir = kubespray_root / "contrib" / "offline" / "offline-files"
+    script = rf"""set -euo pipefail
+CILIUM_VERSION={shlex.quote(cilium_version)}
+HELM_TGZ={HELM_TARBALL.format(v=helm_v)}
+CLI_TGZ={CILIUM_CLI_TARBALL.format(v=cli_v)}
+CHART=helm.cilium.io/cilium-$CILIUM_VERSION.tgz
+REGISTRY=offline-registry:{LOCAL_REGISTRY_PORT}
+cd {files_dir}
+echo 'inet4only = on' > ~/.wgetrc
+for f in "$HELM_TGZ" "$CLI_TGZ" "$CHART"; do wget -nv -c -x "https://$f"; done
+T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
+tar -xzf "$HELM_TGZ" -C "$T"
+tar -xzf "$CLI_TGZ" -C "$T"
+# images of the chart with every optional component the Cilium tab can turn
+# on (hubble relay/ui, certgen, clustermesh, nodeinit), plus the ones
+# `cilium connectivity test` deploys
+{{
+  "$T/linux-amd64/helm" template cilium "$CHART" --namespace kube-system \
+    --set hubble.relay.enabled=true --set hubble.ui.enabled=true \
+    --set hubble.tls.auto.method=cronJob --set clustermesh.useAPIServer=true \
+    --set nodeinit.enabled=true | sed -n 's/^ *image: *//p'
+  "$T/cilium" connectivity test --help \
+    | grep -oE '(quay\.io|docker\.io|registry\.k8s\.io|ghcr\.io|gcr\.io)/[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?(@sha256:[a-f0-9]{{64}})?'
+}} | tr -d "\"'" | sort -u > "helm.cilium.io/cilium-$CILIUM_VERSION.images"
+echo "== $(wc -l < helm.cilium.io/cilium-$CILIUM_VERSION.images) images for Cilium $CILIUM_VERSION -> $REGISTRY"
+copied=0; failed=0
+while read -r img; do
+  name=${{img%@*}}; digest=""; [ "$name" != "$img" ] && digest=${{img#*@}}
+  last=${{name##*/}}
+  if [ "${{last#*:}}" != "$last" ]; then repo=${{name%:*}}; tag=${{name##*:}}; else repo=$name; tag=latest; fi
+  path=${{repo#*/}}
+  if [ -n "$digest" ]; then src="docker://$repo@$digest"; else src="docker://$repo:$tag"; fi
+  if skopeo copy --all --preserve-digests --retry-times 3 --dest-tls-verify=false "$src" "docker://$REGISTRY/$path:$tag" >/dev/null; then
+    echo "ok      $img"; copied=$((copied+1))
+  else
+    echo "FAILED  $img"; failed=$((failed+1))
+  fi
+done < "helm.cilium.io/cilium-$CILIUM_VERSION.images"
+echo "copied $copied, failed $failed"
+[ "$failed" = 0 ]
+"""
+    return f"bash -c {shlex.quote(script)}"
 
 
 def pip_packages_command(kubespray_root: Path) -> str:
@@ -229,7 +387,29 @@ def pip_packages_command(kubespray_root: Path) -> str:
     return f"mkdir -p {outdir} && pip download --no-cache-dir -r {kubespray_root}/requirements.txt -d {outdir}"
 
 
-def offline_yml_updates(host_address: str) -> dict:
+# Upstream registries whose image references containerd should resolve from
+# the local registry too: images that reach the nodes with their ORIGINAL
+# name - Cilium's Helm chart (quay.io/cilium/...@sha256:..., installed by the
+# Cilium tab, not by kubespray's image_repo rewrite) - still come from :5000.
+UPSTREAM_REGISTRIES = ("docker.io", "quay.io", "registry.k8s.io", "ghcr.io", "gcr.io")
+
+
+def containerd_mirrors_block(host_address: str) -> str:
+    # Plain http:// mirror host and NO skip_verify: with skip_verify next to an
+    # http:// host containerd tries HTTPS first (hit for real, see CLAUDE.md).
+    registry = f"{host_address}:{LOCAL_REGISTRY_PORT}"
+    lines = ["containerd_registries_mirrors:"]
+    for prefix in (registry,) + UPSTREAM_REGISTRIES:
+        lines += [
+            f'  - prefix: "{prefix}"',
+            "    mirrors:",
+            f'      - host: "http://{registry}"',
+            '        capabilities: ["pull", "resolve"]',
+        ]
+    return "\n".join(lines)
+
+
+def offline_yml_updates(host_address: str, parsed=None) -> dict:
     # The 4 values kubespray's offline.yml needs to point the REAL target k8s nodes
     # (separate machines) at these repos. Deliberately NOT localhost - that's only
     # correct for the push step above, which runs locally via the Docker socket.
@@ -248,7 +428,7 @@ def offline_yml_updates(host_address: str) -> dict:
     # registry_host }}"` etc.) - this just enables them at their existing templated
     # value, so they always follow whatever registry_host is set to.
     image_repo_template = '"{{ registry_host }}"'
-    return {
+    updates = {
         "registry_host": {"enabled": True, "value": f'"{host_address}:{LOCAL_REGISTRY_PORT}"'},
         "files_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_NGINX_PORT}"'},
         "ubuntu_repo": {"enabled": True, "value": f'"http://{host_address}:{LOCAL_APT_PORT}"'},
@@ -258,7 +438,19 @@ def offline_yml_updates(host_address: str) -> dict:
         "github_image_repo": {"enabled": True, "value": image_repo_template},
         "docker_image_repo": {"enabled": True, "value": image_repo_template},
         "quay_image_repo": {"enabled": True, "value": image_repo_template},
+        "containerd_registries_mirrors": {"enabled": True, "value": containerd_mirrors_block(host_address)},
     }
+    # Every *_download_url placeholder offline.yml ships (kubeadm, kubelet,
+    # containerd, etcd, cni, crictl, ... - 20 in kubespray v2.31): enabled at
+    # its own templated value "{{ files_repo }}/<original host>/<path>", which
+    # is exactly where download-files' `wget -x` stored each file. Left
+    # commented (as before), the nodes downloaded every binary from the
+    # internet during cluster.yml - impossible in an isolated site.
+    if parsed is not None:
+        for e in parsed.entries:
+            if e.key.endswith("_download_url") and "files_repo" in e.value:
+                updates[e.key] = {"enabled": True}
+    return updates
 
 
 IMAGE_REPO_VARS = ("kube_image_repo", "gcr_image_repo", "github_image_repo", "docker_image_repo", "quay_image_repo")
@@ -292,6 +484,16 @@ def upstream_source_vars(kubespray_root: Path, inv_dir: Path) -> dict:
             if e.enabled and e.key.endswith("_download_url") and e.key in defaults:
                 overrides[e.key] = defaults[e.key]
     return overrides
+
+
+def _kubespray_default(kubespray_root: Path, key: str) -> str | None:
+    defaults_dir = kubespray_root / "roles" / "kubespray_defaults" / "defaults" / "main"
+    for f in sorted(defaults_dir.glob("*.yml")):
+        for line in f.read_text().splitlines():
+            m = re.match(rf'^{re.escape(key)}:\s*"?([^"{{]+?)"?\s*$', line)
+            if m:
+                return m.group(1)
+    return None
 
 
 def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_dir: Path, current_version: str, config: dict, status: dict) -> list[dict]:
@@ -376,8 +578,8 @@ def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_di
         "title": "OS packages (Ubuntu)",
         "relevant": True,
         "note": (
-            "Downloads real .deb files (with dependencies) for a curated baseline "
-            "package list, inside a throwaway ubuntu:<release> container so they "
+            "Downloads real .deb files - the full dependency closure - for every "
+            "package kubespray installs on Ubuntu nodes, inside a throwaway ubuntu:<release> container so they "
             "genuinely match your target nodes' Ubuntu release - NOT the webui "
             "container's own Debian base. Then builds a real flat apt repository "
             "index (Packages.gz via dpkg-scanpackages) and serves it on "
@@ -393,26 +595,136 @@ def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_di
         "packages": os_packages,
     })
 
-    helm_relevant = config["helm_enabled"] or config["kube_network_plugin"] == "cilium"
-    cilium_version = config["cilium_version"] or "<cilium_version>"
+    default_cilium = config["cilium_version"] or _kubespray_default(kubespray_root, "cilium_version") or "1.19.3"
     stages.append({
-        "id": "helm-charts",
-        "title": "Helm charts",
-        "relevant": helm_relevant,
+        "id": "cilium-assets",
+        "title": "Cilium for the Cilium tab (helm, cilium CLI, chart, images)",
+        "relevant": True,
+        "version": default_cilium,
         "note": (
-            "This inventory uses Cilium and/or has helm_enabled set, so its addons "
-            "need Helm charts mirrored too. Only Cilium is auto-filled below (the "
-            "one case kubespray's own offline docs call out) - use the form in the "
-            "UI to append pull commands for any other chart-based addon."
-            if helm_relevant else
-            "Not needed for this inventory - container_manager/kube_network_plugin "
-            "don't currently require any Helm chart."
+            "Puts everything the Cilium tab needs into the local mirrors, so Cilium "
+            "installs with no internet: helm and the cilium CLI (kubespray's own "
+            "versions) and the Cilium Helm chart go to the files mirror (:8080), "
+            "and every image the chart and `cilium connectivity test` use is copied "
+            "into the registry (:5000) with its multi-arch digest intact. Run it "
+            "once per Cilium version you want to be able to install."
         ),
-        "command": (
-            f"helm repo add cilium https://helm.cilium.io/ && helm repo update && "
-            f"helm pull cilium/cilium --version {cilium_version} "
-            f"--destination {offline_dir}/helm-charts"
-        ),
+        "command": cilium_assets_command(kubespray_root, default_cilium),
     })
 
     return stages
+
+
+# --- "Ready for an isolated site?" -------------------------------------------
+UPSTREAM_HOST_RE = re.compile(r"^(registry\.k8s\.io|gcr\.io|ghcr\.io|docker\.io|quay\.io)/")
+MANIFEST_ACCEPT = ", ".join([
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+])
+
+
+def _registry_has(registry: str, image: str) -> bool:
+    """image as written in images.list / *.images (upstream host, :tag and/or
+    @digest) -> is that tag in the local registry, under the same path
+    register()/skopeo pushed it to (upstream host stripped)?"""
+    name = image.split("@", 1)[0]
+    last = name.rsplit("/", 1)[-1]
+    repo, tag = (name.rsplit(":", 1) if ":" in last else (name, "latest"))
+    path = UPSTREAM_HOST_RE.sub("", repo)
+    req = urllib.request.Request(f"http://{registry}/v2/{path}/manifests/{tag}", method="HEAD",
+                                 headers={"Accept": MANIFEST_ACCEPT})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return r.status == 200
+    except (urllib.error.URLError, OSError):
+        return False
+
+
+def _check(name: str, ok: bool, detail: str) -> dict:
+    return {"name": name, "ok": ok, "detail": detail}
+
+
+def readiness(kubespray_root: Path, inv_dir: Path, registry: str = f"offline-registry:{LOCAL_REGISTRY_PORT}") -> list[dict]:
+    """Everything an isolated site needs, checked against what is REALLY in the
+    local mirrors (not just "a stage ran once"). Read-only."""
+    offline_dir = kubespray_root / "contrib" / "offline"
+    files_dir = offline_dir / "offline-files"
+    checks = []
+
+    # container images (kubespray) + Cilium images
+    images_list = offline_dir / "temp" / "images.list"
+    for label, lists in (("kubespray images in the registry", [images_list] if images_list.is_file() else []),
+                         ("Cilium images in the registry", sorted((files_dir / "helm.cilium.io").glob("cilium-*.images")))):
+        images = sorted({l.strip() for f in lists for l in f.read_text().splitlines() if l.strip()})
+        if not images:
+            checks.append(_check(label, False, "no image list yet - run the stage that creates it"))
+            continue
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            present = list(pool.map(lambda i: _registry_has(registry, i), images))
+        missing = [i for i, p in zip(images, present) if not p]
+        checks.append(_check(label, not missing,
+                             f"{len(images) - len(missing)}/{len(images)} present"
+                             + (f"; missing: {', '.join(missing[:6])}{' ...' if len(missing) > 6 else ''}" if missing else "")))
+
+    # static files (files.list, wget -x layout) + Cilium tools/chart
+    files_list = offline_dir / "temp" / "files.list"
+    urls = [u.strip() for u in files_list.read_text().splitlines() if u.strip()] if files_list.is_file() else []
+    missing = [u for u in urls if not (files_dir / re.sub(r"^https?://", "", u)).is_file()]
+    checks.append(_check("kubespray files in the files mirror (:8080)", bool(urls) and not missing,
+                         f"{len(urls) - len(missing)}/{len(urls)} present" + (f"; missing: {', '.join(missing[:4])}" if missing else "")
+                         if urls else "no files.list yet - run Generate lists"))
+    helm_v, cli_v = cilium_tool_versions(kubespray_root)
+    charts = offline_cilium_charts(kubespray_root)
+    tools = [HELM_TARBALL.format(v=helm_v), CILIUM_CLI_TARBALL.format(v=cli_v)]
+    tools_missing = [t for t in tools if not (files_dir / t).is_file()]
+    checks.append(_check("Cilium tab: helm, cilium CLI, chart (:8080)", not tools_missing and bool(charts),
+                         f"chart versions: {', '.join(charts) or 'none'}"
+                         + (f"; missing: {', '.join(tools_missing)}" if tools_missing else "")))
+
+    # OS packages
+    pkgs_gz = offline_dir / "os-packages" / "Packages.gz"
+    if pkgs_gz.is_file():
+        index = gzip.decompress(pkgs_gz.read_bytes()).decode(errors="replace")
+        names = set(re.findall(r"^Package: (\S+)", index, re.M))
+        missing = [p for p in BASE_OS_PACKAGES if p not in names]
+        checks.append(_check("OS packages repo (:8081)", not missing,
+                             f"{len(names)} packages in the index" + (f"; missing: {', '.join(missing)}" if missing else "")))
+    else:
+        checks.append(_check("OS packages repo (:8081)", False, "no Packages.gz - run the OS packages stage"))
+
+    pip_dir = offline_dir / "pip-packages"
+    pip_count = len(list(pip_dir.glob("*"))) if pip_dir.is_dir() else 0
+    checks.append(_check("pip packages (:8082)", pip_count > 0, f"{pip_count} files"))
+
+    # offline.yml
+    offline_yml = inv_dir / "group_vars" / "all" / "offline.yml"
+    if offline_yml.is_file():
+        parsed = gv.parse(offline_yml.read_text())
+        enabled = {e.key: e.value for e in parsed.entries if e.enabled}
+        urls_on = sum(1 for k in enabled if k.endswith("_download_url"))
+        urls_all = sum(1 for e in parsed.entries if e.key.endswith("_download_url"))
+        ok = "files_repo" in enabled and "containerd_registries_mirrors" in enabled and urls_on == urls_all
+        checks.append(_check("offline.yml points at this host", ok,
+                             f"registry_host {enabled.get('registry_host', '-')}, files_repo {enabled.get('files_repo', '-')}, "
+                             f"download URLs {urls_on}/{urls_all}, containerd mirrors "
+                             f"{'yes' if 'containerd_registries_mirrors' in enabled else 'no'} "
+                             "(after moving the machine: write it again with the new address)"))
+    else:
+        checks.append(_check("offline.yml points at this host", False, "offline.yml missing in this inventory"))
+
+    # compose images of this stack, so `docker-compose up` needs no pull/build
+    try:
+        me = subprocess.run(["docker", "inspect", "--format", '{{index .Config.Labels "com.docker.compose.project"}}',
+                             subprocess.run(["hostname"], capture_output=True, text=True).stdout.strip()],
+                            capture_output=True, text=True, timeout=10).stdout.strip()
+        imgs = subprocess.run(["docker", "ps", "-a", "--filter", f"label=com.docker.compose.project={me}",
+                               "--format", "{{.Image}}"], capture_output=True, text=True, timeout=10).stdout.split()
+        absent = [i for i in sorted(set(imgs))
+                  if subprocess.run(["docker", "image", "inspect", i], capture_output=True).returncode != 0]
+        checks.append(_check("docker-compose images on this machine", bool(imgs) and not absent,
+                             f"{len(set(imgs))} images of project '{me}'" + (f"; missing: {', '.join(absent)}" if absent else "")))
+    except (OSError, subprocess.SubprocessError) as e:
+        checks.append(_check("docker-compose images on this machine", False, f"could not check: {e}"))
+    return checks

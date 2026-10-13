@@ -1,0 +1,89 @@
+# Points apt on every node at the local offline apt repo (offline-apt
+# service, :8081) - or puts the nodes' own sources back.
+#
+# kubespray does not do this itself: with containerd, `ubuntu_repo` is never
+# used, and roles/system_packages runs `apt-get update` + installs conntrack,
+# socat, ipset, ... through whatever sources the node already has - the
+# internet, which an isolated site does not have. Lives here (kubespray-webui),
+# not in the kubespray checkout, for the same reason as verify-cluster.yml.
+#
+#   offline_apt_mode=enable   move the node's sources to /etc/apt/offline-backup/
+#                             (moved, never deleted), add the local repo, apt update
+#   offline_apt_mode=restore  move them back, remove the local repo entry
+#
+# The repo address comes from `ubuntu_repo` in the inventory's offline.yml
+# (written by Offline Install > "Point kubespray at these repos").
+- name: Offline apt sources on the nodes
+  hosts: all
+  gather_facts: false
+  become: true
+  vars:
+    mode: "{{ offline_apt_mode | default('enable') }}"
+    backup_dir: /etc/apt/offline-backup
+    offline_list: /etc/apt/sources.list.d/kubespray-offline.list
+
+  tasks:
+    - name: Check mode
+      ansible.builtin.assert:
+        that: mode in ['enable', 'restore']
+        fail_msg: "offline_apt_mode must be 'enable' or 'restore', got '{{ mode }}'"
+      run_once: true
+
+    - name: Point apt at the local repo
+      when: mode == 'enable'
+      block:
+        - name: Check ubuntu_repo is set
+          ansible.builtin.assert:
+            that: ubuntu_repo is defined and ubuntu_repo | length > 0
+            fail_msg: >-
+              ubuntu_repo is not set for this inventory - write offline.yml first
+              (Offline Install > "Point kubespray at these repos").
+          run_once: true
+
+        - name: Move the node's own apt sources aside (kept in {{ backup_dir }})
+          ansible.builtin.shell: |
+            set -eu
+            B={{ backup_dir }}
+            mkdir -p "$B/sources.list.d"
+            moved=0
+            if [ -f /etc/apt/sources.list ]; then mv /etc/apt/sources.list "$B/"; moved=$((moved+1)); fi
+            for f in /etc/apt/sources.list.d/*; do
+              [ -e "$f" ] || continue
+              [ "$f" = "{{ offline_list }}" ] && continue
+              mv "$f" "$B/sources.list.d/"; moved=$((moved+1))
+            done
+            echo "moved $moved source file(s) to $B"
+          register: moved
+          changed_when: "'moved 0 ' not in moved.stdout"
+
+        - name: Add the local offline repo
+          ansible.builtin.copy:
+            dest: "{{ offline_list }}"
+            content: "deb [trusted=yes] {{ ubuntu_repo }} ./\n"
+            mode: "0644"
+
+        - name: apt update against the local repo only
+          ansible.builtin.apt:
+            update_cache: true
+
+    - name: Restore the node's own apt sources
+      when: mode == 'restore'
+      block:
+        - name: Move the original sources back
+          ansible.builtin.shell: |
+            set -eu
+            B={{ backup_dir }}
+            restored=0
+            if [ -f "$B/sources.list" ]; then mv "$B/sources.list" /etc/apt/sources.list; restored=$((restored+1)); fi
+            for f in "$B"/sources.list.d/*; do
+              [ -e "$f" ] || continue
+              mv "$f" /etc/apt/sources.list.d/; restored=$((restored+1))
+            done
+            echo "restored $restored source file(s)"
+          register: restored
+          changed_when: "'restored 0 ' not in restored.stdout"
+
+        - name: Remove the local offline repo entry
+          ansible.builtin.file:
+            path: "{{ offline_list }}"
+            state: absent

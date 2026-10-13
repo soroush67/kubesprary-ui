@@ -1102,3 +1102,107 @@ independent booleans). **Not yet run for real** - `afshin` doesn't have
 Cilium installed yet, so there's nothing to uninstall there currently;
 deliberately not triggered as a test since it's a genuinely destructive
 action.
+
+## Isolated-site install (no internet at all) — 2026-10-13
+
+Goal (user's words): prepare everything online, shut the machine down, bring it
+up in an isolated network, `docker-compose up`, install Kubernetes + Cilium.
+User guide: `docs/isolated-install-fa.md`. What was added, all verified:
+
+- **"Point kubespray at these repos"** (`offline_yml_updates()` +
+  `parser.upsert()`): besides registry_host/files_repo/ubuntu/debian_repo and the
+  5 image repos, it now enables **every `*_download_url` placeholder** (they were
+  all commented, so nodes still downloaded kubeadm/kubelet/containerd/... from
+  the internet) and writes **`containerd_registries_mirrors`** for
+  `<host>:5000` + docker.io/quay.io/registry.k8s.io/ghcr.io/gcr.io -> the local
+  registry. `upsert()` appends keys an offline.yml doesn't have at all (sample
+  offline.yml has no mirrors block). One click with the new address after a move.
+  Verified: kubespray_defaults-resolved URLs (kubeadm, kubelet, kubectl,
+  containerd, etcd, cni, crictl, runc, nerdctl, helm, cilium-cli) all point at
+  files that exist under offline-files/.
+- **os-packages**: list aligned with `roles/system_packages` (apparmor, iptables,
+  iproute2, libseccomp2, xfsprogs, python3-apt, ...) and the **full dependency
+  closure** (`apt-cache depends --recurse` + `apt-get download`) instead of
+  `install --download-only`, which skipped deps already in the ubuntu image.
+  Verified: a fresh ubuntu:24.04 on an `--internal` network, apt pointed only at
+  this repo, installs all 25 packages (229 debs).
+- **Installation tab: "Point node apt at offline repo" / "Restore"**
+  (`playbooks/offline-apt.yml`, `/installation/offline-apt`, confirm gate, own
+  lock/log, in the poll snapshot): moves the node's sources to
+  /etc/apt/offline-backup/ (never deletes), adds `deb [trusted=yes] <ubuntu_repo>
+  ./`. Verified against an isolated fake node: enable, idempotent re-run
+  (changed=0), offline install of everything, restore.
+- **container-images (local mode)**: if kubespray's `register` aborts (gotcha #7,
+  metrics-server "does not provide any platform"), every image still missing is
+  copied from its source with `skopeo copy --all --preserve-digests`, and the
+  stage only exits 0 when all of images.list is in the registry. Real run: 48/48
+  (22 filled by skopeo).
+- **New stage "Cilium for the Cilium tab"** (`cilium_assets_command()`, replaced
+  the old copy-paste helm-charts card): kubespray's helm/cilium-cli (already in
+  files.list) + `helm.cilium.io/cilium-<v>.tgz` into offline-files; images from
+  `helm template` (hubble relay/ui, certgen cronJob, clustermesh, nodeinit) +
+  `cilium connectivity test --help` defaults -> registry via
+  `offline-registry:5000` (compose DNS - inside the webui, localhost is not the
+  registry), `skopeo --all --preserve-digests` because the chart pins MANIFEST
+  LIST digests (docker push would break them). Verified: 16/16 copied, chart
+  digests for cilium/operator/envoy identical in the local registry and
+  pull-by-digest returns 200. `skopeo` added to the Dockerfile.
+- **Cilium tab offline mode** (`_cilium_offline()`): on when offline.yml has
+  files_repo enabled -> helm/cli from `{files_repo}/get.helm.sh/...`, chart from
+  `{files_repo}/helm.cilium.io/cilium-<v>.tgz` (no `helm repo add`), version list
+  from disk (no SSH), install refuses a version not in the mirror.
+- **"Ready for an isolated site?"** card (`/offline/readiness`, read-only):
+  registry tags for images.list + Cilium images, files.list on disk, Cilium
+  tools/chart, Packages.gz contents, pip, offline.yml, compose images.
+
+**Real finding (the original "port 5000 doesn't work")**: a real afshin
+cluster.yml run failed pulling `172.22.120.105:5000/pause` with `dial tcp ...
+i/o timeout` - 172.22.120.105 is WSL2's NAT address, unreachable from the LAN
+nodes (192.168.120.x). Windows has 192.168.120.1 on that subnet. Fix is on the
+Windows side (WSL `networkingMode=mirrored`, or netsh portproxy + firewall) -
+documented in the guide, NOT done from here (admin + `wsl --shutdown`).
+containerd's "host will try HTTPS first ... TLS configuration" is only info:
+kubespray's hosts.toml.j2 always writes `skip_verify = false`.
+
+## Move to another server — scripts/transfer.sh (2026-10-13)
+
+`scripts/transfer.sh --host H --user U [--password P|--key K] --dest /abs/path
+[--port N] [--with-backups] [--no-start] [--check-only]` (password also via
+TRANSFER_PASSWORD). Also the Offline Install tab's "Move everything to another
+server" card -> `POST /api/transfer/run` (validated host/user/dest/port,
+confirm gate unless check_only, lock "transfer", state in `offline/plan`'s
+`transfer` key - **include it in the pre-rebuild run-state check**).
+- On the host it re-execs itself inside the `kubespray-webui-webui` image as
+  root (`--network host`, ro mounts, docker socket): some files are root-owned
+  (inventory/<inv>/credentials written by the webui container - must move too)
+  and the image brings sshpass/rsync. Inside the webui (/.dockerenv) it runs
+  directly with WEBUI_DIR=/webui-src (compose mounts the project `.:/webui-src:ro`)
+  and KUBESPRAY_DIR=/kubespray.
+- Steps: checks (target docker usable by the user - NEVER installs docker, user's
+  explicit choice; compose v2/v1; disk at --dest and at DockerRootDir; ports
+  8420/8080-8082/5000/9000/9001 free unless our stack already runs there) ->
+  rsync app + kubespray (excludes container-images/, container-images.tar.gz,
+  offline-files.tar.gz duplicates) -> target .env with COMPOSE_PROJECT_NAME,
+  HOST_KUBESPRAY_ROOT, SSH_DIR -> `docker save|gzip|ssh docker load` for every
+  image of the compose project + alpine -> registry volume via alpine tar
+  stream, byte-count verified -> `compose up -d --no-build` + health check.
+- Re-runs skip images whose `RootFS.Layers` match (NOT `.Id`: differs between
+  docker 29's containerd store and docker 27's classic store - first attempt
+  re-sent everything) and volumes with equal `du -sb`. `.Size` can be the
+  COMPRESSED size (containerd store) -> disk estimate uses x3.
+- compose: fixed `image:` names for webui/backup-sync (target never builds),
+  `HOST_KUBESPRAY_ROOT=${HOST_KUBESPRAY_ROOT:-...}`.
+- Verified end to end against a docker:dind "server" with sshd (user devops, password auth):
+  full transfer (~10 GB), the MOVED webui's readiness check all green except
+  offline.yml (expected - written at the site), credentials present; re-run 6.7s
+  with everything skipped; same via the API. Real 192.168.12.22 (master1, has
+  containerd + /etc/kubernetes, no docker, /home 4.9G, /var/lib 9.5G free):
+  --check-only stops with the "Docker is not installed" message, as intended.
+- Volume check = "<files>:<bytes>" of regular files (find + stat), NOT `du -sb`:
+  du also counts directory sizes, which differ between ext4 (here) and xfs (the
+  real target) - the first real transfer to 192.168.12.22 failed the check with
+  identical data (2439 files, same bytes). Real transfer then completed: all 5
+  ports reachable from the LAN, the target webui's readiness = True.
+- Gotcha: removing a dind test container without `-v` leaves its ~8 GB
+  anonymous volume behind (hit; C: went to 96% - deleted by exact name).
+

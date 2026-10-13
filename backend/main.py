@@ -33,6 +33,7 @@ SAMPLE_DIR = INVENTORY_ROOT / "sample"
 STATIC_DIR = (BASE_DIR / ".." / "static").resolve()
 MOLECULE_ROOT = (BASE_DIR / ".." / "molecule").resolve()
 VERIFY_CLUSTER_PLAYBOOK = (BASE_DIR / ".." / "playbooks" / "verify-cluster.yml").resolve()
+OFFLINE_APT_PLAYBOOK = (BASE_DIR / ".." / "playbooks" / "offline-apt.yml").resolve()
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 BRANCH_NAME_RE = re.compile(r"^(?!-)[A-Za-z0-9._/-]{1,200}$")
@@ -419,6 +420,7 @@ def offline_plan(inv: str):
         "current_version": current, "config": config, "status": status, "stages": stages,
         "offline_dir": offline_dir, "host_offline_dir": host_offline_dir, "running": running,
         "logs": OFFLINE_STAGE_LOGS,
+        "transfer": {"running": TRANSFER_LOCKS["transfer"].locked(), "log": TRANSFER_LOGS["transfer"]},
     }
 
 
@@ -429,6 +431,13 @@ class RegistryPayload(BaseModel):
 
 class OsPackagesPayload(BaseModel):
     ubuntu_release: str = "24.04"
+
+
+class CiliumAssetsPayload(BaseModel):
+    cilium_version: str
+
+
+CILIUM_VERSION_RE = re.compile(r"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$")
 
 
 # Two runs of the *same* offline stage racing each other has repeatedly caused real
@@ -444,6 +453,7 @@ OFFLINE_STAGE_LOCKS: dict[str, asyncio.Lock] = {
     "container-images": asyncio.Lock(),
     "os-packages": asyncio.Lock(),
     "pip-packages": asyncio.Lock(),
+    "cilium-assets": asyncio.Lock(),
 }
 # The live stream in _stream_shell only reaches whichever single browser tab's
 # fetch() is actually reading it - if that tab reloads (or a different tab/session
@@ -566,6 +576,79 @@ class OfflineConfigurePayload(BaseModel):
     host_address: str
 
 
+@app.post("/api/inventories/{inv}/offline/run/cilium-assets")
+def run_cilium_assets(inv: str, payload: CiliumAssetsPayload):
+    _inventory_dir(inv)
+    if not CILIUM_VERSION_RE.match(payload.cilium_version):
+        raise HTTPException(400, "Invalid Cilium version, expected e.g. 1.19.3.")
+    lock = _check_not_running("cilium-assets", OFFLINE_STAGE_LOCKS)
+    cmd = off.cilium_assets_command(KUBESPRAY_ROOT, payload.cilium_version)
+    return StreamingResponse(
+        _stream_shell(cmd, KUBESPRAY_ROOT / "contrib" / "offline", lock, "cilium-assets", OFFLINE_STAGE_LOGS),
+        media_type="text/plain",
+    )
+
+
+# --- "Move to another server" (scripts/transfer.sh): copies the app, the
+# kubespray checkout with every offline download, the stack's images and the
+# registry volume to another server and starts it there. The script runs here
+# in the webui container (it sees /webui-src, /kubespray and the host's docker
+# daemon); the password reaches it only as an environment variable.
+TRANSFER_SCRIPT = Path("/webui-src/scripts/transfer.sh")
+TRANSFER_LOCKS: dict[str, asyncio.Lock] = {"transfer": asyncio.Lock()}
+TRANSFER_LOGS: dict[str, str] = {"transfer": ""}
+DEST_PATH_RE = re.compile(r"^/[A-Za-z0-9._/-]+$")
+
+
+class TransferPayload(BaseModel):
+    host: str
+    port: int = 22
+    user: str
+    password: str | None = None
+    dest: str
+    with_backups: bool = False
+    start: bool = True
+    check_only: bool = False
+    confirm: bool = False
+
+
+@app.post("/api/transfer/run")
+def run_transfer(payload: TransferPayload):
+    if not HOST_ADDR_RE.match(payload.host):
+        raise HTTPException(400, "Invalid host address.")
+    if not SSH_USER_RE.match(payload.user):
+        raise HTTPException(400, "Invalid SSH user.")
+    if not DEST_PATH_RE.match(payload.dest) or ".." in payload.dest:
+        raise HTTPException(400, "Destination must be an absolute path (letters, digits, . _ - /).")
+    if not 1 <= payload.port <= 65535:
+        raise HTTPException(400, "Invalid port.")
+    # copies ~10 GB to another machine and starts containers there
+    if not payload.check_only and not payload.confirm:
+        raise HTTPException(400, "Confirmation required to transfer.")
+    if not TRANSFER_SCRIPT.is_file():
+        raise HTTPException(500, f"{TRANSFER_SCRIPT} not found - is the project mounted at /webui-src (docker-compose.yml)?")
+    lock = _check_not_running("transfer", TRANSFER_LOCKS)
+    args = ["--host", payload.host, "--port", str(payload.port), "--user", payload.user, "--dest", payload.dest]
+    if payload.with_backups:
+        args.append("--with-backups")
+    if not payload.start:
+        args.append("--no-start")
+    if payload.check_only:
+        args.append("--check-only")
+    env = f"TRANSFER_PASSWORD={shlex.quote(payload.password)} " if payload.password else ""
+    cmd = (f"{env}WEBUI_DIR=/webui-src KUBESPRAY_DIR={KUBESPRAY_ROOT} "
+           f"bash {TRANSFER_SCRIPT} " + " ".join(shlex.quote(a) for a in args))
+    return StreamingResponse(_stream_shell(cmd, KUBESPRAY_ROOT, lock, "transfer", TRANSFER_LOGS),
+                             media_type="text/plain")
+
+
+@app.get("/api/inventories/{inv}/offline/readiness")
+def offline_readiness(inv: str):
+    inv_dir = _inventory_dir(inv)
+    checks = off.readiness(KUBESPRAY_ROOT, inv_dir)
+    return {"ready": all(c["ok"] for c in checks), "checks": checks}
+
+
 @app.post("/api/inventories/{inv}/offline/configure")
 def configure_offline_yml(inv: str, payload: OfflineConfigurePayload):
     if not HOST_ADDR_RE.match(payload.host_address):
@@ -573,8 +656,9 @@ def configure_offline_yml(inv: str, payload: OfflineConfigurePayload):
     target = _resolve_file(inv, "all/offline.yml")
     if not target.is_file():
         raise HTTPException(404, "offline.yml does not exist in this inventory.")
-    updates = off.offline_yml_updates(payload.host_address)
-    new_parsed = gv.apply_updates(gv.parse(target.read_text()), updates)
+    parsed = gv.parse(target.read_text())
+    updates = off.offline_yml_updates(payload.host_address, parsed)
+    new_parsed = gv.upsert(parsed, updates, header="Added by kubespray-webui (Offline Install > Point kubespray at these repos)")
     new_text = new_parsed.to_text()
     target.write_text(new_text)
     return {"path": "all/offline.yml", "raw": new_text}
@@ -659,17 +743,33 @@ def _verify_lock(inv: str) -> asyncio.Lock:
     return VERIFY_LOCKS[inv]
 
 
+# "Offline apt on nodes" (playbooks/offline-apt.yml): points every node's apt
+# at the offline-apt repo, or restores the node's own sources. Changes the
+# nodes, so it has its own server-side confirm gate like the install.
+OFFLINE_APT_LOCKS: dict[str, asyncio.Lock] = {}
+OFFLINE_APT_LOGS: dict[str, str] = {}
+
+
+def _offline_apt_lock(inv: str) -> asyncio.Lock:
+    if inv not in OFFLINE_APT_LOCKS:
+        OFFLINE_APT_LOCKS[inv] = asyncio.Lock()
+        OFFLINE_APT_LOGS[inv] = ""
+    return OFFLINE_APT_LOCKS[inv]
+
+
 @app.get("/api/inventories/{inv}/installation/plan")
 def installation_plan(inv: str):
     inv_dir = _inventory_dir(inv)
     lock = _installation_lock(inv)
     conn_lock = _connectivity_lock(inv)
     verify_lock = _verify_lock(inv)
+    apt_lock = _offline_apt_lock(inv)
     command = f"ansible-playbook -i inventory/{inv}/{off.inventory_file(inv_dir)} cluster.yml -b -v"
     return {
         "command": command, "running": lock.locked(), "log": INSTALLATION_LOGS[inv],
         "connectivity_running": conn_lock.locked(), "connectivity_log": CONNECTIVITY_LOGS[inv],
         "verify_running": verify_lock.locked(), "verify_log": VERIFY_LOGS[inv],
+        "offline_apt_running": apt_lock.locked(), "offline_apt_log": OFFLINE_APT_LOGS[inv],
     }
 
 
@@ -717,6 +817,29 @@ def verify_installation(inv: str, payload: InstallPayload):
     command += _auth_flags(payload)
     return StreamingResponse(
         _stream_shell(command, KUBESPRAY_ROOT, lock, inv, VERIFY_LOGS),
+        media_type="text/plain",
+    )
+
+
+class OfflineAptPayload(InstallPayload):
+    mode: str = "enable"  # "enable" | "restore"
+
+
+@app.post("/api/inventories/{inv}/installation/offline-apt")
+def offline_apt(inv: str, payload: OfflineAptPayload):
+    inv_dir = _inventory_dir(inv)
+    if payload.mode not in ("enable", "restore"):
+        raise HTTPException(400, "Invalid mode.")
+    if not payload.confirm:
+        raise HTTPException(400, "Confirmation required: this changes apt sources on every node.")
+    _validate_auth(payload)
+    _offline_apt_lock(inv)
+    lock = _check_not_running(inv, OFFLINE_APT_LOCKS)
+    command = (f"ansible-playbook -i inventory/{inv}/{off.inventory_file(inv_dir)} {OFFLINE_APT_PLAYBOOK} -b -v "
+               f"-e offline_apt_mode={payload.mode}")
+    command += _auth_flags(payload)
+    return StreamingResponse(
+        _stream_shell(command, KUBESPRAY_ROOT, lock, inv, OFFLINE_APT_LOGS),
         media_type="text/plain",
     )
 
@@ -818,10 +941,31 @@ def cilium_plan(inv: str):
     }
 
 
+def _cilium_offline(inv_dir: Path) -> dict | None:
+    """Offline mode for the Cilium tab: on when the inventory's offline.yml
+    has files_repo enabled (Offline Install > "Point kubespray at these
+    repos"). helm/cilium-cli/chart then come from that files mirror and the
+    images from the local registry (containerd mirrors) - see
+    offline.cilium_assets_command(), which put them there."""
+    files_repo = off._active_value(inv_dir, "all/offline.yml", "files_repo")
+    if not files_repo:
+        return None
+    helm_v, cli_v = off.cilium_tool_versions(KUBESPRAY_ROOT)
+    return {"files_repo": files_repo.strip("\"'"), "helm_version": helm_v, "cli_version": cli_v}
+
+
 @app.post("/api/inventories/{inv}/cilium/versions")
 async def cilium_versions(inv: str, payload: CiliumAuthPayload):
     inv_dir = _inventory_dir(inv)
     _validate_auth(payload)
+    if _cilium_offline(inv_dir):
+        # isolated site: only chart versions that are really in the files
+        # mirror can be installed - read them from disk, no SSH, no internet
+        versions = off.offline_cilium_charts(KUBESPRAY_ROOT)
+        if not versions:
+            raise HTTPException(409, "Offline mode (files_repo is set in offline.yml) but no Cilium chart is in "
+                                     "the files mirror - run Offline Install > \"Cilium for the Cilium tab\" first.")
+        return {"versions": versions, "offline": True}
     host = _resolve_cilium_host(inv, inv_dir)
     cmd = cil.versions_command(host, payload.ssh_user, payload.auth_method, payload.ssh_password)
     # First call on a given host also installs helm + the cilium CLI (see
@@ -885,12 +1029,16 @@ def cilium_install(inv: str, payload: CiliumInstallPayload):
     _validate_auth(payload)
     if not payload.cilium_version:
         raise HTTPException(400, "A Cilium version is required.")
+    offline = _cilium_offline(inv_dir)
+    if offline and payload.cilium_version not in off.offline_cilium_charts(KUBESPRAY_ROOT):
+        raise HTTPException(400, f"Cilium {payload.cilium_version} is not in the local files mirror - "
+                                 f"run Offline Install > \"Cilium for the Cilium tab\" for that version first.")
     host = _resolve_cilium_host(inv, inv_dir)
     lock = _check_not_running(inv, CILIUM_INSTALL_LOCKS)
     CILIUM_ACTIVE_ACTION[inv] = "install"
     cmd = cil.install_command(
         host, payload.ssh_user, payload.auth_method, payload.ssh_password,
-        payload.cilium_version, payload.values_yaml,
+        payload.cilium_version, payload.values_yaml, offline=offline,
     )
     return StreamingResponse(
         _stream_shell(cmd, KUBESPRAY_ROOT, lock, inv, CILIUM_INSTALL_LOGS),

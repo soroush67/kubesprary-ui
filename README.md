@@ -64,6 +64,14 @@ your user site-packages. To start the server:
 Then open http://localhost:8420 in a browser. (This mode only runs the web UI
 itself — no RustFS, no backup-sync.)
 
+## Isolated site (no internet)
+
+Prepare everything here, move the machine, `docker-compose up` there and install
+Kubernetes + Cilium with no internet at all - step-by-step guide (Persian):
+[docs/isolated-install-fa.md](docs/isolated-install-fa.md). The Offline Install tab's
+"Ready for an isolated site?" card checks that every image/file/package is really
+in the local mirrors before you shut the machine down.
+
 ## Managing clusters
 
 Use the "+ New" button in the top bar to create a new inventory (it copies

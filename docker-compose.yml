@@ -1,6 +1,9 @@
 services:
   webui:
     build: .
+    # fixed image name: on another server (scripts/transfer.sh) compose finds the
+    # transferred image and never needs to build
+    image: kubespray-webui-webui
     ports:
       - "8420:8420"
     volumes:
@@ -9,6 +12,9 @@ services:
       # Publickey auth for the Installation tab's real cluster.yml runs -
       # same SSH_DIR the backup-sync service already uses below.
       - ${SSH_DIR:-/home/soroush/.ssh}:/root/.ssh:ro
+      # this project itself, read-only - what the "Move to another server" card
+      # (scripts/transfer.sh) copies
+      - .:/webui-src:ro
     environment:
       - KUBESPRAY_ROOT=/kubespray
       # Real host-side path to the kubespray checkout. Needed because `docker run -v`
@@ -16,7 +22,8 @@ services:
       # resolved by the HOST's daemon against HOST paths, not this container's - so
       # any bind-mount source built from KUBESPRAY_ROOT alone would silently mount an
       # empty directory instead of the real checkout. See offline.py.
-      - HOST_KUBESPRAY_ROOT=/home/soroush/infra/kubespray
+      # On another server scripts/transfer.sh writes it into .env.
+      - HOST_KUBESPRAY_ROOT=${HOST_KUBESPRAY_ROOT:-/home/soroush/infra/kubespray}
     restart: unless-stopped
 
   # These four are the "Offline / Air-gapped" tab's repos: permanent, always
@@ -123,6 +130,7 @@ services:
 
   backup-sync:
     build: ./backup-sync
+    image: kubespray-webui-backup-sync
     depends_on:
       - rustfs
     environment:
