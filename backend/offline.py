@@ -705,12 +705,40 @@ def readiness(kubespray_root: Path, inv_dir: Path, registry: str = f"offline-reg
         enabled = {e.key: e.value for e in parsed.entries if e.enabled}
         urls_on = sum(1 for k in enabled if k.endswith("_download_url"))
         urls_all = sum(1 for e in parsed.entries if e.key.endswith("_download_url"))
-        ok = "files_repo" in enabled and "containerd_registries_mirrors" in enabled and urls_on == urls_all
-        checks.append(_check("offline.yml points at this host", ok,
-                             f"registry_host {enabled.get('registry_host', '-')}, files_repo {enabled.get('files_repo', '-')}, "
-                             f"download URLs {urls_on}/{urls_all}, containerd mirrors "
-                             f"{'yes' if 'containerd_registries_mirrors' in enabled else 'no'} "
-                             "(after moving the machine: write it again with the new address)"))
+        # every address must be the SAME host: hand-editing only registry_host
+        # after a move left the mirrors on the old address - nodes then had no
+        # mirror for the new registry, fell back to https:// and failed with
+        # "server gave HTTP response to HTTPS client" (hit for real).
+        hosts = {}
+        for key in ("registry_host", "files_repo", "ubuntu_repo", "debian_repo"):
+            if key in enabled:
+                hosts[key] = re.sub(r"^https?://", "", enabled[key].strip().strip("\"'")).split(":")[0]
+        mirrors = []
+        mirror_entry = next((e for e in parsed.entries if e.key == "containerd_registries_mirrors" and e.enabled), None)
+        if mirror_entry:
+            try:
+                import yaml
+                for m in (yaml.safe_load(mirror_entry.raw_block) or {}).get("containerd_registries_mirrors") or []:
+                    mirrors.append(str(m.get("prefix", "")))
+                    for h in m.get("mirrors") or []:
+                        hosts[f"mirror for {m.get('prefix')}"] = re.sub(r"^https?://", "", str(h.get("host", ""))).split(":")[0]
+            except Exception as exc:  # noqa: BLE001 - report, don't crash the check
+                hosts["containerd_registries_mirrors"] = f"unparsable ({exc})"
+        registry = enabled.get("registry_host", "").strip().strip("\"'")
+        expected = hosts.get("registry_host")
+        mismatched = {k: v for k, v in hosts.items() if v != expected}
+        no_mirror = bool(registry) and registry not in mirrors
+        ok = ("files_repo" in enabled and mirror_entry is not None and urls_on == urls_all
+              and not mismatched and not no_mirror)
+        detail = (f"registry_host {registry or '-'}, files_repo {enabled.get('files_repo', '-')}, "
+                  f"download URLs {urls_on}/{urls_all}, containerd mirrors {len(mirrors)}")
+        if mismatched:
+            detail += f"; DIFFERENT ADDRESSES: {', '.join(f'{k}={v}' for k, v in mismatched.items())}"
+        if no_mirror:
+            detail += f"; no containerd mirror for {registry} (nodes would try https and fail)"
+        if not ok:
+            detail += " - write it again with \"Point kubespray at these repos\""
+        checks.append(_check("offline.yml points at this host", ok, detail))
     else:
         checks.append(_check("offline.yml points at this host", False, "offline.yml missing in this inventory"))
 

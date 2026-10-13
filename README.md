@@ -74,6 +74,10 @@ in the local mirrors before you shut the machine down.
 
 ## Managing clusters
 
+Persian guide to every day-2 operation (add worker / control plane / etcd,
+remove node, reset, scale, upgrade, kube-proxy vs Cilium, etcd backups) with the
+exact CLI commands: [docs/cluster-operations-fa.md](docs/cluster-operations-fa.md).
+
 Use the "+ New" button in the top bar to create a new inventory (it copies
 `inventory/sample`, or the currently-selected inventory, into a new
 `inventory/<name>` directory). You still need to edit that inventory's

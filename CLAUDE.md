@@ -1206,3 +1206,23 @@ confirm gate unless check_only, lock "transfer", state in `offline/plan`'s
 - Gotcha: removing a dind test container without `-v` leaves its ~8 GB
   anonymous volume behind (hit; C: went to 96% - deleted by exact name).
 
+- **2026-10-14, real failure on 192.168.12.21 (K8S-05, stack in
+  /home/devops/kubespary-offline)**: cluster.yml failed pulling
+  `192.168.12.21:5000/pause` with "server gave HTTP response to HTTPS client".
+  offline.yml had registry_host/files_repo hand-edited to .21 but
+  containerd_registries_mirrors still on .22 -> no mirror for the registry
+  prefix -> containerd used its default `https://<prefix>`. Fixed there by
+  running the configure card (API) with 192.168.12.21 (backup at
+  /tmp/offline.yml.before-fix on that host). The readiness check now also
+  requires every address (registry_host, files_repo, ubuntu/debian_repo, every
+  mirror host) to be the same host and a mirror whose prefix == registry_host -
+  verified: the broken file -> NO with the exact mismatches, the fixed one -> OK.
+
+### Day-2 operations guide (Persian)
+`docs/cluster-operations-fa.md` - add worker/control-plane/etcd, remove node
+(incl. first control plane), reset, scale, upgrade, kube_proxy_remove + removing
+an existing kube-proxy before Cilium kube-proxy replacement, etcd backup timer.
+Commands mirror buildOpsCommands in static/app.js - keep them in sync.
+`kube_proxy_remove: true` was set in inventory/afshin/group_vars/k8s_cluster/
+k8s-cluster.yml on the source host and on 192.168.12.21 (kubespray checkout,
+not this repo); verified kube_proxy_deployed=False via boilerplate.yml.
