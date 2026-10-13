@@ -144,7 +144,10 @@ installs a systemd timer + script on etcd nodes for periodic
   start.
 - `backup-sync` — pulls etcd snapshots off etcd nodes via
   `ansible.posix.synchronize` (mode=pull), mirrors into RustFS bucket
-  `etcd-backups` via `mc`. Needs SSH key dir mounted (`SSH_DIR` in `.env`,
+  `etcd-backups` via **rclone** (`rclone copy`, remote defined purely via
+  `RCLONE_CONFIG_RUSTFS_*` env vars). Was MinIO's `mc` until 2026-10-13:
+  `dl.min.io` now answers HTTP 410 Gone for the mc binary, which broke the
+  `backup-sync` build; rclone comes from Debian apt instead. Needs SSH key dir mounted (`SSH_DIR` in `.env`,
   default `/home/soroush/.ssh` — currently empty, no real etcd cluster
   exists yet to test against).
 
@@ -447,6 +450,32 @@ both found by hitting them in practice:
     `172.22.120.105:5000` directly - fixed at the host level
     (`/etc/docker/daemon.json` + `live-restore: true` + daemon restart),
     outside this repo entirely, not a code change here.
+
+11. **(Real bug, 2026-10-13) generate-lists rendered images.list with the
+    inventory's offline.yml, so container-images tried to pull from the
+    still-empty local registry itself.** `generate_list.sh -i inventory/<inv>`
+    applies `kube_image_repo: "{{ registry_host }}"` etc., so every entry
+    came out as `172.22.120.105:5000/coreos/etcd:...` - and `create()` PULLS
+    exactly those names. This only "worked" before (gotcha #10) because the
+    registry already held the images from earlier runs; once the
+    `offline_registry_data` volume was recreated empty, the stage failed on
+    the very first image (5 retries, `not found`) and :5000 stayed empty -
+    nodes asking for `coreos/etcd:v3.6.10` got 404 ("port 5000 doesn't
+    work"). Fixed in `offline.py`: `upstream_source_vars()` reads the
+    upstream defaults of the 5 `*_image_repo` vars (+ any `*_download_url`
+    the inventory overrides) from the checked-out kubespray's
+    `roles/kubespray_defaults/defaults/main/*.yml` and generate-lists passes
+    them as `-e @contrib/offline/temp/upstream-sources.json` (a file, not
+    inline JSON: generate_list.sh forwards its args to ansible-playbook
+    unquoted via `$*`, so JSON with spaces got split - hit for real:
+    `the playbook: "registry.k8s.io", could not be found`). The inventory is
+    still used for versions/CNI/runtime. Verified on `afshin`: 48 images,
+    all upstream (`quay.io`/`registry.k8s.io`/`docker.io`/`ghcr.io`), same
+    paths as before minus the host - create() strips those hosts itself, so
+    register() pushes `localhost:5000/coreos/etcd:...`, exactly what nodes
+    request. container-images now also refuses a stale list (first entry
+    with a `host:port` prefix) with a "re-run Generate lists" message,
+    mirrored in `app.js`'s `buildContainerImagesCommand()` preview.
 
 ### Verification status — all 5 stages confirmed working end-to-end (2026-07-10)
 

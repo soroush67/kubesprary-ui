@@ -10,6 +10,9 @@ security trade-off that entails.
 """
 from __future__ import annotations
 
+import json
+import re
+import shlex
 from pathlib import Path
 
 import parser as gv
@@ -138,8 +141,19 @@ def container_images_command(kubespray_root: Path, registry_mode: str, registry_
             private_registry = first_line.split("/", 1)[0]
     private_registry_env = f"PRIVATE_REGISTRY={private_registry} " if private_registry else ""
 
+    # create() PULLS every image in images.list. A list generated before the
+    # upstream_source_vars() fix points at the local mirror itself
+    # ("172.22.120.105:5000/coreos/etcd:...") - pulling from the registry we are
+    # about to fill can only work if it already has the images. Upstream
+    # registries never carry a :port, so a host:port prefix means "stale list".
+    stale_list_guard = (
+        f"if head -1 {offline_dir}/temp/images.list | cut -d/ -f1 | grep -q ':'; then "
+        "echo 'images.list points at a private registry, not the original sources: "
+        "run \"Generate file & image lists\" again first.'; exit 1; fi && "
+    )
+
     return (
-        f"cd {offline_dir} && {private_registry_env}IMAGES_FROM_FILE={offline_dir}/temp/images.list "
+        f"cd {offline_dir} && {stale_list_guard}{private_registry_env}IMAGES_FROM_FILE={offline_dir}/temp/images.list "
         f"./manage-offline-container-images.sh create && "
         f"DESTINATION_REGISTRY={dest} ./manage-offline-container-images.sh register"
     )
@@ -247,9 +261,46 @@ def offline_yml_updates(host_address: str) -> dict:
     }
 
 
+IMAGE_REPO_VARS = ("kube_image_repo", "gcr_image_repo", "github_image_repo", "docker_image_repo", "quay_image_repo")
+
+
+def upstream_source_vars(kubespray_root: Path, inv_dir: Path) -> dict:
+    """Upstream (internet) values for every variable offline.yml points at the
+    local mirrors, read from this kubespray version's own role defaults.
+
+    generate-lists must render images.list/files.list with the ORIGINAL
+    sources: container-images then pulls from them and pushes into the local
+    registry (manage-offline-container-images.sh strips registry.k8s.io/quay.io/
+    ... itself), and download-files fetches from them. Rendered with the
+    inventory's offline.yml instead, every entry pointed at the still-empty
+    local registry ("172.22.120.105:5000/coreos/etcd:v3.6.10") - the pull
+    failed on the very first image and the registry on :5000 stayed empty.
+    The inventory is still used for everything else (versions, CNI, runtime).
+    """
+    defaults_dir = kubespray_root / "roles" / "kubespray_defaults" / "defaults" / "main"
+    defaults: dict[str, str] = {}
+    for f in sorted(defaults_dir.glob("*.yml")):
+        for line in f.read_text().splitlines():
+            m = re.match(r'^([a-z0-9_]+(?:_image_repo|_download_url)):\s*"?(.*?)"?\s*$', line)
+            if m and m.group(1) not in defaults:
+                defaults[m.group(1)] = m.group(2)
+
+    overrides = {k: defaults[k] for k in IMAGE_REPO_VARS if k in defaults}
+    # *_download_url lines offline.yml (or any group_vars file) has enabled
+    for f in sorted((inv_dir / "group_vars").rglob("*.yml")):
+        for e in gv.parse(f.read_text()).entries:
+            if e.enabled and e.key.endswith("_download_url") and e.key in defaults:
+                overrides[e.key] = defaults[e.key]
+    return overrides
+
+
 def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_dir: Path, current_version: str, config: dict, status: dict) -> list[dict]:
     offline_dir = kubespray_root / "contrib" / "offline"
     inventory_arg = f"inventory/{inv}/{inventory_file(inv_dir)}"
+    # via a file: generate_list.sh hands its arguments to ansible-playbook
+    # unquoted ($*), so inline JSON with spaces would be split into words
+    upstream_file = offline_dir / "temp" / "upstream-sources.json"
+    upstream_json = shlex.quote(json.dumps(upstream_source_vars(kubespray_root, inv_dir)))
 
     stages = []
 
@@ -259,9 +310,15 @@ def build_plan(kubespray_root: Path, host_kubespray_root: Path, inv: str, inv_di
         "relevant": True,
         "note": (
             "Renders files.list and images.list for the currently checked-out "
-            f"kubespray version ({current_version}) and this inventory's settings."
+            f"kubespray version ({current_version}) and this inventory's settings, "
+            "with the original internet sources (registry.k8s.io, quay.io, ...) "
+            "instead of the local mirrors from offline.yml - that is where the "
+            "next stages download from."
         ),
-        "command": f"cd {kubespray_root} && ./contrib/offline/generate_list.sh -i {inventory_arg}",
+        "command": (
+            f"mkdir -p {upstream_file.parent} && printf '%s\\n' {upstream_json} > {upstream_file} && "
+            f"cd {kubespray_root} && ./contrib/offline/generate_list.sh -i {inventory_arg} -e @{upstream_file}"
+        ),
     })
 
     stages.append({

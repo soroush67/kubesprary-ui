@@ -1089,7 +1089,11 @@ const OFFLINE_LOCAL_PIP_PORT = 8082;
 function buildContainerImagesCommand(offlineDir) {
   const f = state.offlineForm;
   const dest = (f.registryMode === "remote" && f.registryAddress) ? f.registryAddress : `localhost:${OFFLINE_LOCAL_REGISTRY_PORT}`;
-  return `cd ${offlineDir} && IMAGES_FROM_FILE=${offlineDir}/temp/images.list ` +
+  // same stale-list guard as offline.py's container_images_command()
+  const guard = `if head -1 ${offlineDir}/temp/images.list | cut -d/ -f1 | grep -q ':'; then ` +
+    `echo 'images.list points at a private registry, not the original sources: ` +
+    `run "Generate file & image lists" again first.'; exit 1; fi && `;
+  return `cd ${offlineDir} && ${guard}IMAGES_FROM_FILE=${offlineDir}/temp/images.list ` +
     `./manage-offline-container-images.sh create && DESTINATION_REGISTRY=${dest} ./manage-offline-container-images.sh register`;
 }
 

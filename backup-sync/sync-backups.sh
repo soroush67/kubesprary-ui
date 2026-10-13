@@ -29,11 +29,20 @@ find_inventory_file() {
   return 1
 }
 
-until mc alias set rustfs "$RUSTFS_ENDPOINT" "$RUSTFS_ACCESS_KEY" "$RUSTFS_SECRET_KEY" >/dev/null 2>&1; do
+# rclone remote "rustfs:" defined via environment (no config file needed)
+export RCLONE_CONFIG=/dev/null            # remote is fully defined below; no config file
+export RCLONE_CONFIG_RUSTFS_TYPE=s3
+export RCLONE_CONFIG_RUSTFS_PROVIDER=Other
+export RCLONE_CONFIG_RUSTFS_ENDPOINT="$RUSTFS_ENDPOINT"
+export RCLONE_CONFIG_RUSTFS_ACCESS_KEY_ID="$RUSTFS_ACCESS_KEY"
+export RCLONE_CONFIG_RUSTFS_SECRET_ACCESS_KEY="$RUSTFS_SECRET_KEY"
+export RCLONE_CONFIG_RUSTFS_FORCE_PATH_STYLE=true
+
+until rclone lsd rustfs: >/dev/null 2>&1; do
   log "waiting for rustfs at $RUSTFS_ENDPOINT ..."
   sleep 5
 done
-mc mb --ignore-existing "rustfs/${RUSTFS_BUCKET}" >/dev/null
+rclone mkdir "rustfs:${RUSTFS_BUCKET}"
 
 while true; do
   if INVENTORY_FILE="$(find_inventory_file)"; then
@@ -42,7 +51,8 @@ while true; do
         -e "ansible_ssh_common_args='-o StrictHostKeyChecking=accept-new'" \
         -m ansible.posix.synchronize \
         -a "mode=pull src=${ETCD_BACKUP_PREFIX}/ dest=${STAGING_DIR}/{{ inventory_hostname }}/ rsync_opts=--ignore-existing,--relative"; then
-      mc mirror --overwrite "$STAGING_DIR/" "rustfs/${RUSTFS_BUCKET}/"
+      # like the old `mc mirror --overwrite`: upload new/changed files, never delete from the bucket
+      rclone copy "$STAGING_DIR/" "rustfs:${RUSTFS_BUCKET}/"
       log "sync complete"
     else
       log "ansible pull failed, will retry next cycle"
